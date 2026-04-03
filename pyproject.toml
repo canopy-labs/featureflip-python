@@ -42,6 +42,7 @@ dev = [
 [project.urls]
 Homepage = "https://featureflip.io"
 Documentation = "https://featureflip.io/docs/sdks/python/"
+Repository = "https://github.com/canopy-labs/featureflip-python"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/featureflip"]
