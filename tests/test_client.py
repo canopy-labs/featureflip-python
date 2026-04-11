@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from featureflip._core import _reset_for_testing
 from featureflip.client import FeatureflipClient
 from featureflip.config import Config
 from featureflip.detail import EvaluationDetail, EvaluationReason
@@ -44,12 +45,25 @@ def create_test_flag(
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_featureflip_cache() -> None:
+    """Clear the _LIVE_CORES cache before and after every test in this module.
+
+    This prevents cross-test contamination via the singleton-by-construction
+    dedupe: tests that construct clients with the same SDK key would otherwise
+    share state through the cache.
+    """
+    _reset_for_testing()
+    yield
+    _reset_for_testing()
+
+
 class TestClientInitialization:
     """Tests for client initialization."""
 
     def test_init_with_sdk_key(self) -> None:
         """Constructor accepts SDK key directly."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -64,7 +78,7 @@ class TestClientInitialization:
         """Constructor falls back to FEATUREFLIP_SDK_KEY env var."""
         with (
             patch.dict(os.environ, {"FEATUREFLIP_SDK_KEY": "env-key"}),
-            patch("featureflip.client.HttpClient") as mock_http,
+            patch("featureflip._core.HttpClient") as mock_http,
         ):
             mock_http.return_value.get_flags.return_value = ([], [])
 
@@ -90,7 +104,7 @@ class TestClientInitialization:
 
     def test_init_raises_on_timeout(self) -> None:
         """Constructor raises InitializationError on timeout."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             # Simulate slow response
             def slow_get_flags() -> tuple[list[FlagConfiguration], list]:
                 time.sleep(5)
@@ -110,7 +124,7 @@ class TestClientInitialization:
 
     def test_init_raises_on_http_error(self) -> None:
         """Constructor raises InitializationError on HTTP error."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.side_effect = Exception("Connection failed")
 
             with pytest.raises(InitializationError, match="Connection failed"):
@@ -121,7 +135,7 @@ class TestClientInitialization:
 
     def test_is_initialized_property(self) -> None:
         """is_initialized returns True after successful init."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
@@ -138,7 +152,7 @@ class TestVariation:
 
     def test_returns_evaluated_value(self) -> None:
         """variation() returns the evaluated flag value."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([
                 create_test_flag(key="my-flag", value=True),
             ], [])
@@ -155,7 +169,7 @@ class TestVariation:
 
     def test_returns_default_on_unknown_flag(self) -> None:
         """variation() returns default when flag is not found."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -170,7 +184,7 @@ class TestVariation:
 
     def test_never_raises(self) -> None:
         """variation() never raises, returns default on any error."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
@@ -180,8 +194,8 @@ class TestVariation:
 
             # Mock evaluator to raise an error
             from unittest.mock import MagicMock
-            client._evaluator = MagicMock()
-            client._evaluator.evaluate.side_effect = RuntimeError("Evaluation crashed!")
+            client._core._evaluator = MagicMock()
+            client._core._evaluator.evaluate.side_effect = RuntimeError("Evaluation crashed!")
 
             # Should return default without raising
             result = client.variation("test-flag", {"user_id": "123"}, default="safe")
@@ -191,7 +205,7 @@ class TestVariation:
 
     def test_queues_event_when_track_true(self) -> None:
         """variation() queues evaluation event when track=True."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
@@ -200,20 +214,20 @@ class TestVariation:
             )
 
             # Mock the event processor
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.variation("test-flag", {"user_id": "123"}, default=False, track=True)
 
             # Check event was queued
-            client._event_processor.queue_event.assert_called_once()
-            event = client._event_processor.queue_event.call_args[0][0]
+            client._core._event_processor.queue_event.assert_called_once()
+            event = client._core._event_processor.queue_event.call_args[0][0]
             assert event["type"] == "Evaluation"
             assert event["flagKey"] == "test-flag"
             client.close()
 
     def test_skips_event_when_track_false(self) -> None:
         """variation() skips event when track=False."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
@@ -222,12 +236,12 @@ class TestVariation:
             )
 
             # Mock the event processor
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.variation("test-flag", {"user_id": "123"}, default=False, track=False)
 
             # Check no event was queued
-            client._event_processor.queue_event.assert_not_called()
+            client._core._event_processor.queue_event.assert_not_called()
             client.close()
 
 
@@ -236,7 +250,7 @@ class TestVariationDetail:
 
     def test_returns_detail_object(self) -> None:
         """variation_detail() returns EvaluationDetail object."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
@@ -253,7 +267,7 @@ class TestVariationDetail:
 
     def test_returns_flag_not_found_for_unknown(self) -> None:
         """variation_detail() returns FLAG_NOT_FOUND for unknown flags."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -273,7 +287,7 @@ class TestTrack:
 
     def test_queues_custom_event(self) -> None:
         """track() queues a custom event."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -282,13 +296,13 @@ class TestTrack:
             )
 
             # Mock the event processor
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.track("purchase", {"user_id": "123"}, metadata={"amount": 99.99})
 
             # Check event was queued
-            client._event_processor.queue_event.assert_called_once()
-            event = client._event_processor.queue_event.call_args[0][0]
+            client._core._event_processor.queue_event.assert_called_once()
+            event = client._core._event_processor.queue_event.call_args[0][0]
             assert event["type"] == "Custom"
             assert event["flagKey"] == "purchase"
             assert event["metadata"]["amount"] == 99.99
@@ -300,7 +314,7 @@ class TestIdentify:
 
     def test_queues_identify_event(self) -> None:
         """identify() queues an identify event."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -309,13 +323,13 @@ class TestIdentify:
             )
 
             # Mock the event processor
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.identify({"user_id": "123", "email": "test@example.com"})
 
             # Check event was queued
-            client._event_processor.queue_event.assert_called_once()
-            event = client._event_processor.queue_event.call_args[0][0]
+            client._core._event_processor.queue_event.assert_called_once()
+            event = client._core._event_processor.queue_event.call_args[0][0]
             assert event["type"] == "Identify"
             assert event["context"]["user_id"] == "123"
             assert event["context"]["email"] == "test@example.com"
@@ -323,7 +337,7 @@ class TestIdentify:
 
     def test_identify_event_includes_flagkey(self) -> None:
         """identify() includes flagKey '$identify' per SDK event contract."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -331,11 +345,11 @@ class TestIdentify:
                 config=Config(streaming=False, send_events=False),
             )
 
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.identify({"user_id": "123"})
 
-            event = client._event_processor.queue_event.call_args[0][0]
+            event = client._core._event_processor.queue_event.call_args[0][0]
             assert event["flagKey"] == "$identify"
             client.close()
 
@@ -345,7 +359,7 @@ class TestFlush:
 
     def test_flushes_events(self) -> None:
         """flush() flushes pending events."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -354,11 +368,11 @@ class TestFlush:
             )
 
             # Mock the event processor
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.flush()
 
-            client._event_processor.flush.assert_called_once()
+            client._core._event_processor.flush.assert_called_once()
             client.close()
 
 
@@ -367,7 +381,7 @@ class TestClose:
 
     def test_shuts_down_cleanly(self) -> None:
         """close() shuts down all components."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -386,7 +400,7 @@ class TestContextManager:
 
     def test_context_manager_works(self) -> None:
         """Context manager enters and exits cleanly."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             with FeatureflipClient(
@@ -450,7 +464,7 @@ class TestTestClient:
 
     def test_set_test_value_raises_on_non_test_client(self) -> None:
         """set_test_value() raises on non-test client."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([], [])
 
             client = FeatureflipClient(
@@ -458,7 +472,7 @@ class TestTestClient:
                 config=Config(streaming=False, send_events=False),
             )
 
-            with pytest.raises(RuntimeError, match="test client"):
+            with pytest.raises(RuntimeError, match="test"):
                 client.set_test_value("flag", "value")
 
             client.close()
@@ -472,7 +486,7 @@ class TestTestClient:
 
     def test_test_client_no_network_calls(self) -> None:
         """Test client makes no network calls."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             client = FeatureflipClient.for_testing({"flag": True})
 
             # Verify HttpClient was never instantiated
@@ -492,8 +506,8 @@ class TestStreaming:
     def test_starts_streaming_by_default(self) -> None:
         """Client starts streaming handler when streaming=True."""
         with (
-            patch("featureflip.client.HttpClient") as mock_http,
-            patch("featureflip.client.StreamingHandler") as mock_stream,
+            patch("featureflip._core.HttpClient") as mock_http,
+            patch("featureflip._core.StreamingHandler") as mock_stream,
         ):
             mock_http.return_value.get_flags.return_value = ([], [])
 
@@ -509,8 +523,8 @@ class TestStreaming:
     def test_starts_polling_when_streaming_disabled(self) -> None:
         """Client starts polling handler when streaming=False."""
         with (
-            patch("featureflip.client.HttpClient") as mock_http,
-            patch("featureflip.client.PollingHandler") as mock_poll,
+            patch("featureflip._core.HttpClient") as mock_http,
+            patch("featureflip._core.PollingHandler") as mock_poll,
         ):
             mock_http.return_value.get_flags.return_value = ([], [])
 
@@ -530,8 +544,8 @@ class TestEventProcessing:
     def test_starts_event_processor_when_enabled(self) -> None:
         """Client starts event processor when send_events=True."""
         with (
-            patch("featureflip.client.HttpClient") as mock_http,
-            patch("featureflip.client.EventProcessor") as mock_events,
+            patch("featureflip._core.HttpClient") as mock_http,
+            patch("featureflip._core.EventProcessor") as mock_events,
         ):
             mock_http.return_value.get_flags.return_value = ([], [])
 
@@ -547,8 +561,8 @@ class TestEventProcessing:
     def test_no_event_processor_when_disabled(self) -> None:
         """Client does not start event processor when send_events=False."""
         with (
-            patch("featureflip.client.HttpClient") as mock_http,
-            patch("featureflip.client.EventProcessor") as mock_events,
+            patch("featureflip._core.HttpClient") as mock_http,
+            patch("featureflip._core.EventProcessor") as mock_events,
         ):
             mock_http.return_value.get_flags.return_value = ([], [])
 
@@ -571,7 +585,7 @@ class TestPollingUpdate:
         without that flag. The client must clear the old store so deleted
         flags don't persist.
         """
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             # Initial flags: flag-a and flag-b
             mock_http.return_value.get_flags.return_value = ([
                 create_test_flag(key="flag-a", value=True),
@@ -588,7 +602,7 @@ class TestPollingUpdate:
             assert client.variation("flag-b", {"user_id": "1"}, default=False) is True
 
             # Simulate polling update: only flag-a remains (flag-b was deleted)
-            client._on_polling_update([
+            client._core._on_polling_update([
                 create_test_flag(key="flag-a", value=True),
             ])
 
@@ -603,7 +617,7 @@ class TestPollingUpdate:
         """Polling updates should replace the entire segment store, not merge."""
         from featureflip.models import ConditionLogic, Segment
 
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             seg_a = Segment(key="seg-a", version=1, conditions=[], condition_logic=ConditionLogic.AND)
             seg_b = Segment(key="seg-b", version=1, conditions=[], condition_logic=ConditionLogic.AND)
 
@@ -615,15 +629,15 @@ class TestPollingUpdate:
             )
 
             # Both segments exist
-            assert client._get_segment("seg-a") is not None
-            assert client._get_segment("seg-b") is not None
+            assert client._core._get_segment("seg-a") is not None
+            assert client._core._get_segment("seg-b") is not None
 
             # Simulate polling update: only seg-a remains
-            client._on_polling_update([], segments=[seg_a])
+            client._core._on_polling_update([], segments=[seg_a])
 
-            assert client._get_segment("seg-a") is not None
+            assert client._core._get_segment("seg-a") is not None
             # seg-b should be gone
-            assert client._get_segment("seg-b") is None
+            assert client._core._get_segment("seg-b") is None
 
             client.close()
 
@@ -633,7 +647,7 @@ class TestThreadSafety:
 
     def test_concurrent_evaluations_are_safe(self) -> None:
         """Multiple threads can safely evaluate flags concurrently."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([
                 create_test_flag(key="flag-1", value=True),
                 create_test_flag(key="flag-2", value="hello"),
@@ -673,18 +687,18 @@ class TestEvaluationEventKeys:
 
     def test_evaluation_event_uses_camelcase_flag_key(self) -> None:
         """_queue_evaluation_event must use 'flagKey' not 'flag_key'."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
                 sdk_key="test-key",
                 config=Config(streaming=False, send_events=False),
             )
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             client.variation("test-flag", {"user_id": "123"}, default=False, track=True)
 
-            event = client._event_processor.queue_event.call_args[0][0]
+            event = client._core._event_processor.queue_event.call_args[0][0]
             assert "flagKey" in event, f"Event should use 'flagKey' but has keys: {list(event.keys())}"
             assert "flag_key" not in event, "Event should not use snake_case 'flag_key'"
             assert event["flagKey"] == "test-flag"
@@ -692,7 +706,7 @@ class TestEvaluationEventKeys:
 
     def test_evaluation_event_uses_camelcase_rule_id(self) -> None:
         """_queue_evaluation_event must use 'ruleId' not 'rule_id'."""
-        with patch("featureflip.client.HttpClient") as mock_http:
+        with patch("featureflip._core.HttpClient") as mock_http:
             flag = create_test_flag()
             mock_http.return_value.get_flags.return_value = ([flag], [])
 
@@ -700,7 +714,7 @@ class TestEvaluationEventKeys:
                 sdk_key="test-key",
                 config=Config(streaming=False, send_events=False),
             )
-            client._event_processor = MagicMock()
+            client._core._event_processor = MagicMock()
 
             # Call _queue_evaluation_event directly with a rule_id
             client._queue_evaluation_event(
@@ -711,7 +725,7 @@ class TestEvaluationEventKeys:
                 rule_id="rule-abc",
             )
 
-            event = client._event_processor.queue_event.call_args[0][0]
+            event = client._core._event_processor.queue_event.call_args[0][0]
             assert "ruleId" in event, f"Event should use 'ruleId' but has keys: {list(event.keys())}"
             assert "rule_id" not in event, "Event should not use snake_case 'rule_id'"
             assert event["ruleId"] == "rule-abc"

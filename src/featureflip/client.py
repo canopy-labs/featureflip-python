@@ -3,26 +3,13 @@
 from __future__ import annotations
 
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import structlog
 
-from featureflip._events import EventProcessor
-from featureflip._http import HttpClient
-from featureflip._polling import PollingHandler
-from featureflip._streaming import StreamingHandler
+from featureflip._core import _get_or_create_core, _SharedFeatureflipCore
 from featureflip.config import Config
-from featureflip.context import EvaluationContext
 from featureflip.detail import EvaluationDetail, EvaluationReason
-from featureflip.evaluation import FlagEvaluator
-from featureflip.exceptions import InitializationError
-
-if TYPE_CHECKING:
-    from featureflip.models import FlagConfiguration, Segment
 
 logger = structlog.get_logger()
 
@@ -31,6 +18,11 @@ T = TypeVar("T")
 
 class FeatureflipClient:
     """Main client for interacting with the Featureflip service.
+
+    Multiple instances constructed with the same SDK key share an underlying
+    refcounted client. Two ``FeatureflipClient(sdk_key="x")`` calls return
+    distinct handle objects that delegate to the same shared core; the core
+    shuts down only when the last handle is closed.
 
     This client handles:
     - Initial flag loading with timeout
@@ -70,215 +62,17 @@ class FeatureflipClient:
             raise ValueError(
                 "SDK key is required. Pass sdk_key parameter or set FEATUREFLIP_SDK_KEY env var."
             )
-        self._sdk_key: str = resolved_key
+        resolved_config = config or Config()
 
-        # Use default config if not provided
-        self._config = config or Config()
-
-        # Flag and segment storage (thread-safe)
-        self._flags: dict[str, FlagConfiguration] = {}
-        self._segments: dict[str, Segment] = {}
-        self._flags_lock = threading.RLock()
-        self._initialized = threading.Event()
-
-        # Test mode flag
-        self._test_mode = False
-        self._test_values: dict[str, Any] = {}
-
-        # Components
-        self._http_client: HttpClient | None = None
-        self._evaluator = FlagEvaluator()
-        self._streaming_handler: StreamingHandler | None = None
-        self._polling_handler: PollingHandler | None = None
-        self._event_processor: EventProcessor | None = None
-
-        # Initialize
-        self._initialize()
-
-    def _initialize(self) -> None:
-        """Initialize the client by fetching flags and starting background processes."""
-        # Create HTTP client
-        self._http_client = HttpClient(self._sdk_key, self._config)
-
-        # Fetch initial flags with timeout
-        self._fetch_initial_flags()
-
-        # Start streaming or polling
-        if self._config.streaming:
-            self._start_streaming()
-        else:
-            self._start_polling()
-
-        # Start event processor if enabled
-        if self._config.send_events:
-            self._start_event_processor()
-
-    def _fetch_initial_flags(self) -> None:
-        """Fetch initial flag configurations with timeout.
-
-        Raises:
-            InitializationError: If fetching times out or fails.
-        """
-        # HTTP client must be set before calling this method
-        assert self._http_client is not None
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._http_client.get_flags)
-            try:
-                flags, segments = future.result(timeout=self._config.init_timeout)
-                self._update_flags(flags)
-                self._update_segments(segments)
-                self._initialized.set()
-                logger.info("client_initialized", flag_count=len(flags))
-            except FuturesTimeoutError as e:
-                raise InitializationError(
-                    f"Initialization timeout after {self._config.init_timeout}s"
-                ) from e
-            except Exception as e:
-                raise InitializationError(f"Failed to initialize: {e}") from e
-
-    def _update_flags(self, flags: list[FlagConfiguration]) -> None:
-        """Update stored flags (thread-safe).
-
-        Args:
-            flags: List of flag configurations to store.
-        """
-        with self._flags_lock:
-            for flag in flags:
-                self._flags[flag.key] = flag
-
-    def _update_segments(self, segments: list[Segment]) -> None:
-        """Update stored segments (thread-safe).
-
-        Args:
-            segments: List of segment configurations to store.
-        """
-        with self._flags_lock:
-            for segment in segments:
-                self._segments[segment.key] = segment
-
-    def _get_segment(self, key: str) -> Segment | None:
-        """Get a segment by key (thread-safe).
-
-        Args:
-            key: Segment key to look up.
-
-        Returns:
-            Segment if found, None otherwise.
-        """
-        with self._flags_lock:
-            return self._segments.get(key)
-
-    def _update_single_flag(self, flag: FlagConfiguration) -> None:
-        """Update a single flag (thread-safe).
-
-        Args:
-            flag: Flag configuration to update.
-        """
-        with self._flags_lock:
-            self._flags[flag.key] = flag
-
-    def _on_streaming_flag_updated(self, key: str) -> None:
-        """Handle flag update from streaming — fetch and update single flag."""
-        try:
-            if self._http_client is None:
-                return
-            flag = self._http_client.get_flag(key)
-            self._update_single_flag(flag)
-        except Exception as e:
-            logger.warning("streaming_flag_fetch_error", key=key, error=str(e))
-
-    def _on_streaming_flag_deleted(self, key: str) -> None:
-        """Handle flag deletion from streaming."""
-        with self._flags_lock:
-            self._flags.pop(key, None)
-
-    def _on_streaming_segment_updated(self) -> None:
-        """Handle segment update from streaming — refetch all."""
-        try:
-            if self._http_client is None:
-                return
-            flags, segments = self._http_client.get_flags()
-            self._update_flags(flags)
-            self._update_segments(segments)
-        except Exception as e:
-            logger.warning("streaming_segment_refetch_error", error=str(e))
-
-    def _on_streaming_error(self, error: Exception) -> None:
-        """Handle streaming error.
-
-        Args:
-            error: The error that occurred.
-        """
-        logger.warning("streaming_error", error=str(error))
-
-    def _on_polling_update(self, flags: list[FlagConfiguration], segments: list[Segment] | None = None) -> None:
-        """Handle flags update from polling.
-
-        Polling receives full snapshots, so we replace the entire store
-        rather than merging. This ensures deleted flags/segments are removed.
-
-        Args:
-            flags: Updated flag configurations (full snapshot).
-            segments: Updated segment configurations (full snapshot).
-        """
-        with self._flags_lock:
-            self._flags = {flag.key: flag for flag in flags}
-            if segments is not None:
-                self._segments = {segment.key: segment for segment in segments}
-
-    def _on_polling_error(self, error: Exception) -> None:
-        """Handle polling error.
-
-        Args:
-            error: The error that occurred.
-        """
-        logger.warning("polling_error", error=str(error))
-
-    def _start_streaming(self) -> None:
-        """Start the streaming handler."""
-        self._streaming_handler = StreamingHandler(
-            sdk_key=self._sdk_key,
-            config=self._config,
-            on_flag_updated=self._on_streaming_flag_updated,
-            on_flag_deleted=self._on_streaming_flag_deleted,
-            on_segment_updated=self._on_streaming_segment_updated,
-            on_error=self._on_streaming_error,
+        # Get-or-create the shared core. Subsequent constructions with the
+        # same SDK key return a handle pointing at the cached core; only the
+        # first call actually spins up background threads and fetches flags.
+        self._core: _SharedFeatureflipCore = _get_or_create_core(
+            resolved_key, resolved_config
         )
-        self._streaming_handler.start()
+        self._closed = False
 
-    def _start_polling(self) -> None:
-        """Start the polling handler."""
-        assert self._http_client is not None
-        self._polling_handler = PollingHandler(
-            http_client=self._http_client,
-            config=self._config,
-            on_update=self._on_polling_update,
-            on_error=self._on_polling_error,
-        )
-        self._polling_handler.start()
-
-    def _start_event_processor(self) -> None:
-        """Start the event processor."""
-        assert self._http_client is not None
-        self._event_processor = EventProcessor(
-            http_client=self._http_client,
-            flush_interval=self._config.flush_interval,
-            flush_batch_size=self._config.flush_batch_size,
-        )
-        self._event_processor.start()
-
-    def _get_flag(self, key: str) -> FlagConfiguration | None:
-        """Get a flag by key (thread-safe).
-
-        Args:
-            key: Flag key to look up.
-
-        Returns:
-            Flag configuration if found, None otherwise.
-        """
-        with self._flags_lock:
-            return self._flags.get(key)
+    # --- Typed evaluation methods ---
 
     def variation(
         self,
@@ -300,37 +94,21 @@ class FeatureflipClient:
         Returns:
             The evaluated flag value or default.
         """
+        if self._closed:
+            return default
         try:
-            # Handle test mode
-            if self._test_mode:
-                value = self._test_values.get(key, default)
-                return cast("T", value)
-
-            # Get flag
-            flag = self._get_flag(key)
-            if flag is None:
-                logger.debug("flag_not_found", key=key)
-                return default
-
-            # Create evaluation context
-            eval_context = EvaluationContext.from_dict(context or {})
-
-            # Evaluate
-            detail = self._evaluator.evaluate(flag, eval_context, self._get_segment)
+            detail = self._core.evaluate(key, context or {}, default)
             value = detail.value if detail.value is not None else default
 
-            # Track evaluation
-            if track and self._event_processor is not None:
-                self._queue_evaluation_event(
+            if track:
+                self._core.queue_evaluation_event(
                     key=key,
                     value=value,
                     context=context or {},
                     reason=detail.reason,
                     rule_id=detail.rule_id,
                 )
-
             return cast("T", value)
-
         except Exception as e:
             logger.warning("evaluation_error", key=key, error=str(e))
             return default
@@ -343,6 +121,8 @@ class FeatureflipClient:
     ) -> EvaluationDetail:
         """Evaluate a flag with detailed result.
 
+        Does NOT track an evaluation event (matches the pre-refactor behavior).
+
         Args:
             key: Flag key to evaluate.
             context: Context dictionary with user attributes.
@@ -351,38 +131,11 @@ class FeatureflipClient:
         Returns:
             EvaluationDetail with value, reason, and optional rule_id.
         """
-        try:
-            # Handle test mode
-            if self._test_mode:
-                value = self._test_values.get(key, default)
-                if key in self._test_values:
-                    return EvaluationDetail(value=value, reason=EvaluationReason.FALLTHROUGH)
-                return EvaluationDetail(value=default, reason=EvaluationReason.FLAG_NOT_FOUND)
+        if self._closed:
+            return EvaluationDetail(value=default, reason=EvaluationReason.ERROR)
+        return self._core.evaluate(key, context or {}, default)
 
-            # Get flag
-            flag = self._get_flag(key)
-            if flag is None:
-                return EvaluationDetail(value=default, reason=EvaluationReason.FLAG_NOT_FOUND)
-
-            # Create evaluation context
-            eval_context = EvaluationContext.from_dict(context or {})
-
-            # Evaluate
-            detail = self._evaluator.evaluate(flag, eval_context, self._get_segment)
-
-            # Ensure default is used if value is None
-            if detail.value is None:
-                return EvaluationDetail(
-                    value=default,
-                    reason=detail.reason,
-                    rule_id=detail.rule_id,
-                )
-
-            return detail
-
-        except Exception as e:
-            logger.warning("evaluation_error", key=key, error=str(e))
-            return EvaluationDetail(value=default, reason=EvaluationReason.ERROR, error=e)
+    # --- Event tracking ---
 
     def track(
         self,
@@ -390,85 +143,53 @@ class FeatureflipClient:
         context: dict[str, Any],
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Track a custom event.
-
-        Args:
-            event_name: Name of the event to track.
-            context: Context dictionary with user attributes.
-            metadata: Optional additional metadata for the event.
-        """
-        if self._test_mode or self._event_processor is None:
+        """Track a custom event."""
+        if self._closed:
             return
-
-        event = {
-            "type": "Custom",
-            "flagKey": event_name,
-            "context": context or {},
-            "metadata": metadata or {},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self._event_processor.queue_event(event)
+        self._core.track(event_name, context, metadata)
 
     def identify(self, context: dict[str, Any]) -> None:
-        """Send user attributes for segment building.
-
-        Args:
-            context: Context dictionary with user attributes.
-        """
-        if self._test_mode or self._event_processor is None:
+        """Send user attributes for segment building."""
+        if self._closed:
             return
-
-        event = {
-            "type": "Identify",
-            "flagKey": "$identify",
-            "context": context or {},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self._event_processor.queue_event(event)
+        self._core.identify(context)
 
     def flush(self) -> None:
         """Flush pending events immediately."""
-        if self._event_processor is not None:
-            self._event_processor.flush()
+        if self._closed:
+            return
+        self._core.flush()
 
-    def close(self) -> None:
-        """Shut down the client, flushing events and stopping background threads."""
-        # Stop streaming or polling
-        if self._streaming_handler is not None:
-            self._streaming_handler.stop()
-            self._streaming_handler = None
-
-        if self._polling_handler is not None:
-            self._polling_handler.stop()
-            self._polling_handler = None
-
-        # Stop event processor (flushes remaining events)
-        if self._event_processor is not None:
-            self._event_processor.stop()
-            self._event_processor = None
-
-        # Close HTTP client
-        if self._http_client is not None:
-            self._http_client.close()
-            self._http_client = None
-
-        logger.info("client_closed")
+    # --- Lifecycle ---
 
     @property
     def is_initialized(self) -> bool:
         """Return True if the client has loaded flags.
 
-        Returns:
-            True if initialized, False otherwise.
+        Returns False if this handle has been closed, even if other handles
+        pointing at the same shared core are still alive.
         """
-        return self._initialized.is_set() or self._test_mode
+        if self._closed:
+            return False
+        return self._core.is_initialized
+
+    def close(self) -> None:
+        """Close this handle.
+
+        Decrements the refcount on the shared core. If this is the last live
+        handle for the core's SDK key, the core shuts down (flushes events,
+        stops background threads, closes HTTP client). Otherwise the core
+        stays alive and other handles continue to work.
+
+        Safe to call multiple times on the same handle; subsequent calls are
+        no-ops.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._core._release()
 
     def __enter__(self) -> FeatureflipClient:
-        """Enter context manager.
-
-        Returns:
-            This client instance.
-        """
         return self
 
     def __exit__(
@@ -477,14 +198,9 @@ class FeatureflipClient:
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
-        """Exit context manager and close the client.
-
-        Args:
-            exc_type: Exception type if an exception was raised.
-            exc_val: Exception value if an exception was raised.
-            exc_tb: Exception traceback if an exception was raised.
-        """
         self.close()
+
+    # --- Test-stub factory ---
 
     @classmethod
     def for_testing(cls, flags: dict[str, Any]) -> FeatureflipClient:
@@ -495,6 +211,7 @@ class FeatureflipClient:
         - Does not start background threads
         - Does not track events
         - Ignores context (always returns fixed values)
+        - Does NOT participate in the _LIVE_CORES cache (no SDK key collision)
 
         Args:
             flags: Dictionary mapping flag keys to their values.
@@ -510,29 +227,16 @@ class FeatureflipClient:
             >>> client.variation("feature-a", {}, default=False)
             True
         """
-        # Create instance without calling __init__
+        # Create instance without calling __init__ (same technique the original
+        # used). Then wire up a standalone test-stub core that never enters
+        # _LIVE_CORES (it has no sdk_key).
         instance = object.__new__(cls)
-
-        # Set up test mode
-        instance._test_mode = True
-        instance._test_values = dict(flags)
-
-        # Set up minimal state
-        instance._sdk_key = "test-key"
-        instance._config = Config()
-        instance._flags = {}
-        instance._segments = {}
-        instance._flags_lock = threading.RLock()
-        instance._initialized = threading.Event()
-        instance._initialized.set()
-
-        # No components
-        instance._http_client = None
-        instance._evaluator = FlagEvaluator()
-        instance._streaming_handler = None
-        instance._polling_handler = None
-        instance._event_processor = None
-
+        instance._core = _SharedFeatureflipCore(
+            sdk_key=None,
+            config=Config(),
+            test_mode_values=dict(flags),
+        )
+        instance._closed = False
         return instance
 
     def set_test_value(self, key: str, value: Any) -> None:
@@ -545,9 +249,7 @@ class FeatureflipClient:
         Raises:
             RuntimeError: If called on a non-test client.
         """
-        if not self._test_mode:
-            raise RuntimeError("set_test_value() can only be called on a test client")
-        self._test_values[key] = value
+        self._core.set_test_value(key, value)
 
     def _queue_evaluation_event(
         self,
@@ -557,27 +259,15 @@ class FeatureflipClient:
         reason: EvaluationReason,
         rule_id: str | None = None,
     ) -> None:
-        """Queue an evaluation event.
+        """Queue an evaluation event. Delegates to the shared core.
 
-        Args:
-            key: Flag key that was evaluated.
-            value: Value that was returned.
-            context: Context used for evaluation.
-            reason: Reason for the evaluation result.
-            rule_id: ID of matched rule, if any.
+        Preserved for backwards compatibility with existing tests that call
+        this method directly on the client.
         """
-        if self._event_processor is None:
-            return
-
-        event: dict[str, Any] = {
-            "type": "Evaluation",
-            "flagKey": key,
-            "value": value,
-            "context": context,
-            "reason": reason.value,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if rule_id is not None:
-            event["ruleId"] = rule_id
-
-        self._event_processor.queue_event(event)
+        self._core.queue_evaluation_event(
+            key=key,
+            value=value,
+            context=context,
+            reason=reason,
+            rule_id=rule_id,
+        )

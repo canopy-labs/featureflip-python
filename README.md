@@ -28,6 +28,8 @@ else:
 client.close()
 ```
 
+> **Lifetime:** Multiple `FeatureflipClient(sdk_key="x")` calls with the same SDK key return distinct handles sharing one underlying client — you cannot accidentally open duplicate streaming connections by constructing multiple clients. `close()` is refcounted; the real shutdown runs only when the last handle is closed.
+
 ## Configuration
 
 ```python

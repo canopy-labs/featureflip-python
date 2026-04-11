@@ -14,6 +14,7 @@ import pytest
 import respx
 
 from featureflip import Config, FeatureflipClient
+from featureflip._core import _reset_for_testing
 from featureflip.exceptions import InitializationError
 
 # Mock flag response - boolean flag
@@ -104,6 +105,19 @@ def no_events_config() -> Config:
         poll_interval=60.0,  # Long interval for tests that don't need polling
         init_timeout=5.0,
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_featureflip_cache() -> None:
+    """Clear the _LIVE_CORES cache before and after every test in this module.
+
+    This prevents cross-test contamination via the singleton-by-construction
+    dedupe: tests that construct clients with the same SDK key would otherwise
+    share state through the cache.
+    """
+    _reset_for_testing()
+    yield
+    _reset_for_testing()
 
 
 class TestClientInitialization:
@@ -561,8 +575,8 @@ class TestContextManager:
 
         # After exiting context manager, client should be closed
         # (internal state cleaned up)
-        assert client._http_client is None
-        assert client._polling_handler is None
+        assert client._core._http_client is None
+        assert client._core._polling_handler is None
 
     @respx.mock
     def test_context_manager_closes_on_exception(
@@ -583,7 +597,7 @@ class TestContextManager:
             raise RuntimeError("Test exception")
 
         # Client should still be closed (context manager __exit__ was called)
-        assert client._http_client is None
+        assert client._core._http_client is None
 
 
 class TestErrorRecovery:
