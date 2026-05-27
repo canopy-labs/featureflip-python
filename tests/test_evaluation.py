@@ -1021,3 +1021,304 @@ class TestConditionGroupEvaluation:
             ),
         ]
         assert evaluator.evaluate_condition_groups(groups, context) is False
+
+
+class TestPrerequisiteResolution:
+    """Tests for prerequisite flag evaluation."""
+
+    @pytest.fixture
+    def evaluator(self) -> FlagEvaluator:
+        return FlagEvaluator()
+
+    @pytest.fixture
+    def ctx(self) -> EvaluationContext:
+        return EvaluationContext.from_dict({"user_id": "user-1"})
+
+    def _make_flag(
+        self,
+        key: str = "test-flag",
+        *,
+        enabled: bool = True,
+        fallthrough_variation: str = "on",
+        prerequisites: list | None = None,
+    ):
+        from featureflip.models import (
+            FlagConfiguration,
+            FlagType,
+            ServeConfig,
+            ServeType,
+            Variation,
+        )
+
+        return FlagConfiguration(
+            key=key,
+            version=1,
+            type=FlagType.BOOLEAN,
+            enabled=enabled,
+            variations=[
+                Variation(key="on", value=True),
+                Variation(key="off", value=False),
+            ],
+            rules=[],
+            fallthrough=ServeConfig(type=ServeType.FIXED, variation=fallthrough_variation),
+            off_variation="off",
+            prerequisites=prerequisites or [],
+        )
+
+    def test_no_prerequisites_falls_through(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """Flag with no prerequisites evaluates normally."""
+        from featureflip.detail import EvaluationReason
+
+        flag = self._make_flag("main", prerequisites=[])
+        result = evaluator.evaluate(flag, ctx, all_flags={})
+        assert result.reason == EvaluationReason.FALLTHROUGH
+        assert result.value is True
+
+    def test_satisfied_prerequisite_serves_on(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """When prerequisite serves the expected variation, main falls through."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        prereq = self._make_flag("prereq", fallthrough_variation="on")
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="prereq", expected_variation_key="on"
+                )
+            ],
+        )
+        result = evaluator.evaluate(main, ctx, all_flags={"prereq": prereq})
+        assert result.reason == EvaluationReason.FALLTHROUGH
+        assert result.value is True
+        assert result.prerequisite_key is None
+
+    def test_unsatisfied_prerequisite_serves_off(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """When prerequisite serves a different variation, main serves off."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        prereq = self._make_flag("prereq", fallthrough_variation="off")
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="prereq", expected_variation_key="on"
+                )
+            ],
+        )
+        result = evaluator.evaluate(main, ctx, all_flags={"prereq": prereq})
+        assert result.reason == EvaluationReason.PREREQUISITE_FAILED
+        assert result.value is False
+        assert result.prerequisite_key == "prereq"
+
+    def test_disabled_prerequisite_serves_off(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """A disabled prerequisite resolves to its off variation; if that doesn't
+        match expected, main serves off with prerequisite-failed reason."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        prereq = self._make_flag("prereq", enabled=False)
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="prereq", expected_variation_key="on"
+                )
+            ],
+        )
+        result = evaluator.evaluate(main, ctx, all_flags={"prereq": prereq})
+        assert result.reason == EvaluationReason.PREREQUISITE_FAILED
+        assert result.prerequisite_key == "prereq"
+
+    def test_multi_prereq_reports_first_failing_key(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """When multiple prerequisites fail, the first one in the list is reported."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        prereq_a = self._make_flag("prereq-a", fallthrough_variation="off")
+        prereq_b = self._make_flag("prereq-b", fallthrough_variation="off")
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="prereq-a", expected_variation_key="on"
+                ),
+                Prerequisite(
+                    prerequisite_flag_key="prereq-b", expected_variation_key="on"
+                ),
+            ],
+        )
+        result = evaluator.evaluate(
+            main, ctx, all_flags={"prereq-a": prereq_a, "prereq-b": prereq_b}
+        )
+        assert result.reason == EvaluationReason.PREREQUISITE_FAILED
+        assert result.prerequisite_key == "prereq-a"
+
+    def test_chained_prerequisites_resolve(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """A prerequisite's own prerequisites are resolved recursively."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        grandchild = self._make_flag("grandchild", fallthrough_variation="on")
+        child = self._make_flag(
+            "child",
+            fallthrough_variation="on",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="grandchild", expected_variation_key="on"
+                )
+            ],
+        )
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="child", expected_variation_key="on"
+                )
+            ],
+        )
+        result = evaluator.evaluate(
+            main, ctx, all_flags={"grandchild": grandchild, "child": child}
+        )
+        assert result.reason == EvaluationReason.FALLTHROUGH
+        assert result.value is True
+
+        # Break the chain at the grandchild level
+        grandchild_failing = self._make_flag(
+            "grandchild", fallthrough_variation="off"
+        )
+        result2 = evaluator.evaluate(
+            main,
+            ctx,
+            all_flags={"grandchild": grandchild_failing, "child": child},
+        )
+        assert result2.reason == EvaluationReason.PREREQUISITE_FAILED
+
+    def test_missing_prerequisite_flag_fails_safely(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """If the prerequisite flag isn't in all_flags, serve off with the
+        prerequisite key set."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="missing-flag",
+                    expected_variation_key="on",
+                )
+            ],
+        )
+        result = evaluator.evaluate(main, ctx, all_flags={})
+        assert result.reason == EvaluationReason.PREREQUISITE_FAILED
+        assert result.value is False
+        assert result.prerequisite_key == "missing-flag"
+
+    def test_depth_exceeded_returns_error(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """A chain longer than MAX_PREREQUISITE_DEPTH returns reason 'error'."""
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import Prerequisite
+
+        flags = {}
+        for i in range(12):
+            key = f"flag-{i}"
+            prereqs = (
+                [
+                    Prerequisite(
+                        prerequisite_flag_key=f"flag-{i - 1}",
+                        expected_variation_key="on",
+                    )
+                ]
+                if i > 0
+                else []
+            )
+            flags[key] = self._make_flag(
+                key, fallthrough_variation="on", prerequisites=prereqs
+            )
+        top = flags["flag-11"]
+        result = evaluator.evaluate(top, ctx, all_flags=flags)
+        assert result.reason == EvaluationReason.ERROR
+
+    def test_evaluate_with_shared_memo_reuses_result(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """Memo passed across calls prevents redundant re-evaluation."""
+        from featureflip.detail import EvaluationDetail, EvaluationReason
+        from featureflip.models import Prerequisite
+
+        prereq = self._make_flag("prereq", fallthrough_variation="on")
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="prereq", expected_variation_key="on"
+                )
+            ],
+        )
+
+        memo: dict[str, EvaluationDetail] = {
+            "prereq": EvaluationDetail(
+                value=True,
+                reason=EvaluationReason.FALLTHROUGH,
+                variation_key="on",
+            )
+        }
+        result = evaluator.evaluate_with_shared_memo(
+            main, ctx, all_flags={"prereq": prereq}, memo=memo
+        )
+        assert result.reason == EvaluationReason.FALLTHROUGH
+        # memo should now also include the main flag's result
+        assert "main" in memo
+
+    def test_backward_compatible_evaluate_signature(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """Calling evaluate() without all_flags still works (for flags without
+        prerequisites). Regression guard for existing callers."""
+        from featureflip.detail import EvaluationReason
+
+        flag = self._make_flag("main")
+        result = evaluator.evaluate(flag, ctx)
+        assert result.reason == EvaluationReason.FALLTHROUGH
+        assert result.value is True
+
+    def test_shared_memo_caches_disabled_prerequisite(
+        self, evaluator: FlagEvaluator, ctx: EvaluationContext
+    ) -> None:
+        """A disabled prerequisite is memoised so a sibling flag sharing the
+        same prereq doesn't re-evaluate it."""
+        from featureflip.detail import EvaluationDetail, EvaluationReason
+        from featureflip.models import Prerequisite
+
+        disabled_prereq = self._make_flag("shared", enabled=False)
+        main = self._make_flag(
+            "main",
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key="shared", expected_variation_key="on"
+                )
+            ],
+        )
+        memo: dict[str, EvaluationDetail] = {}
+        evaluator.evaluate_with_shared_memo(
+            main, ctx, all_flags={"shared": disabled_prereq}, memo=memo
+        )
+        assert "shared" in memo
+        assert memo["shared"].reason == EvaluationReason.FLAG_DISABLED

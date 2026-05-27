@@ -202,13 +202,19 @@ class _SharedFeatureflipCore:
                 return EvaluationDetail(value=default, reason=EvaluationReason.FLAG_NOT_FOUND)
 
             eval_context = EvaluationContext.from_dict(context or {})
-            detail = self._evaluator.evaluate(flag, eval_context, self._get_segment)
+            with self._flags_lock:
+                all_flags = dict(self._flags)
+            detail = self._evaluator.evaluate(
+                flag, eval_context, self._get_segment, all_flags=all_flags
+            )
 
             if detail.value is None:
                 return EvaluationDetail(
                     value=default,
                     reason=detail.reason,
                     rule_id=detail.rule_id,
+                    variation_key=detail.variation_key,
+                    prerequisite_key=detail.prerequisite_key,
                 )
             return detail
         except Exception as e:

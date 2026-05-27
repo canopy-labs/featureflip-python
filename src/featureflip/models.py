@@ -244,6 +244,23 @@ class Segment:
 
 
 @dataclass(frozen=True)
+class Prerequisite:
+    """A dependency on another flag's served variation.
+
+    A flag with prerequisites only evaluates its rules and fallthrough when
+    every prerequisite resolves to the expected variation. Otherwise the
+    off variation is served.
+
+    Attributes:
+        prerequisite_flag_key: The key of the flag that must be satisfied.
+        expected_variation_key: The variation key the prerequisite must serve.
+    """
+
+    prerequisite_flag_key: str
+    expected_variation_key: str
+
+
+@dataclass(frozen=True)
 class FlagConfiguration:
     """Complete configuration for a feature flag.
 
@@ -256,6 +273,8 @@ class FlagConfiguration:
         rules: Targeting rules evaluated in priority order.
         fallthrough: Serve config when no rules match (and flag is enabled).
         off_variation: Variation key to serve when flag is disabled.
+        prerequisites: Other flags that must serve specific variations before
+            this flag's rules and fallthrough are evaluated.
     """
 
     key: str
@@ -266,6 +285,7 @@ class FlagConfiguration:
     rules: tuple[TargetingRule, ...]
     fallthrough: ServeConfig
     off_variation: str
+    prerequisites: tuple[Prerequisite, ...] = ()
     _variations_by_key: dict[str, Variation] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -280,6 +300,7 @@ class FlagConfiguration:
         rules: list[TargetingRule] | tuple[TargetingRule, ...],
         fallthrough: ServeConfig,
         off_variation: str,
+        prerequisites: list[Prerequisite] | tuple[Prerequisite, ...] = (),
     ) -> None:
         """Initialize FlagConfiguration with internal lookup index."""
         object.__setattr__(self, "key", key)
@@ -290,6 +311,7 @@ class FlagConfiguration:
         object.__setattr__(self, "rules", tuple(rules))
         object.__setattr__(self, "fallthrough", fallthrough)
         object.__setattr__(self, "off_variation", off_variation)
+        object.__setattr__(self, "prerequisites", tuple(prerequisites))
         # Build lookup index
         variations_by_key = {v.key: v for v in variations}
         object.__setattr__(self, "_variations_by_key", variations_by_key)

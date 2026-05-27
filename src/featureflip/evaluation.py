@@ -27,6 +27,8 @@ from featureflip.models import (
 
 logger = structlog.get_logger()
 
+MAX_PREREQUISITE_DEPTH = 10
+
 
 class FlagEvaluator:
     """Evaluates feature flags against context."""
@@ -241,30 +243,122 @@ class FlagEvaluator:
         flag: FlagConfiguration,
         context: EvaluationContext,
         get_segment: Callable[[str], Segment | None] | None = None,
+        all_flags: dict[str, FlagConfiguration] | None = None,
     ) -> EvaluationDetail:
         """Evaluate a flag against context.
 
         Evaluation order:
         1. If flag disabled, return off variation
-        2. Evaluate rules in priority order (0 = highest)
-        3. First matching rule wins
-        4. If no rules match, use fallthrough
+        2. Resolve prerequisites; if any fail, serve off variation
+        3. Evaluate rules in priority order (0 = highest)
+        4. First matching rule wins
+        5. If no rules match, use fallthrough
 
         Args:
             flag: The flag configuration to evaluate.
             context: The evaluation context with user attributes.
             get_segment: Optional callable to look up segments by key.
+            all_flags: Map of all flags in the environment, keyed by flag key.
+                Required for prerequisite resolution; if omitted, only flags
+                without prerequisites can be evaluated correctly.
 
         Returns:
             An EvaluationDetail containing the value, reason, and optional rule_id.
         """
+        memo: dict[str, EvaluationDetail] = {}
+        return self._evaluate_internal(
+            flag, context, get_segment, all_flags or {}, depth=0, memo=memo
+        )
+
+    def evaluate_with_shared_memo(
+        self,
+        flag: FlagConfiguration,
+        context: EvaluationContext,
+        all_flags: dict[str, FlagConfiguration],
+        memo: dict[str, EvaluationDetail],
+        get_segment: Callable[[str], Segment | None] | None = None,
+    ) -> EvaluationDetail:
+        """Evaluate a flag while sharing a memoisation map with other calls.
+
+        Use this when evaluating multiple flags in a single batch so shared
+        prerequisite flags are evaluated only once across the batch.
+
+        Args:
+            flag: The flag configuration to evaluate.
+            context: The evaluation context.
+            all_flags: Map of all flags in the environment, keyed by flag key.
+            memo: Memoisation dict shared across evaluations in the batch.
+            get_segment: Optional callable to look up segments by key.
+
+        Returns:
+            An EvaluationDetail with the result. The memo is also updated.
+        """
+        return self._evaluate_internal(
+            flag, context, get_segment, all_flags, depth=0, memo=memo
+        )
+
+    def _evaluate_internal(
+        self,
+        flag: FlagConfiguration,
+        context: EvaluationContext,
+        get_segment: Callable[[str], Segment | None] | None,
+        all_flags: dict[str, FlagConfiguration],
+        depth: int,
+        memo: dict[str, EvaluationDetail],
+    ) -> EvaluationDetail:
+        # Guard against runaway recursion. Cycle detection happens at write
+        # time on the server, so reaching this branch is defensive.
+        if depth > MAX_PREREQUISITE_DEPTH:
+            result = self._serve_off(flag, EvaluationReason.ERROR)
+            memo[flag.key] = result
+            return result
+
         # Step 1: Check if flag is disabled
         if not flag.enabled:
-            variation = flag.get_variation(flag.off_variation)
-            value = variation.value if variation else None
-            return EvaluationDetail(value=value, reason=EvaluationReason.FLAG_DISABLED)
+            result = self._serve_off(flag, EvaluationReason.FLAG_DISABLED)
+            memo[flag.key] = result
+            return result
 
-        # Step 2: Evaluate rules in priority order
+        # Step 2: Resolve prerequisites
+        for prereq in flag.prerequisites:
+            prereq_result = memo.get(prereq.prerequisite_flag_key)
+            if prereq_result is None:
+                prereq_flag = all_flags.get(prereq.prerequisite_flag_key)
+                if prereq_flag is None:
+                    # Stale reference (delete-blocking should have prevented this — defensive)
+                    result = self._serve_off(
+                        flag,
+                        EvaluationReason.PREREQUISITE_FAILED,
+                        prerequisite_key=prereq.prerequisite_flag_key,
+                    )
+                    memo[flag.key] = result
+                    return result
+                prereq_result = self._evaluate_internal(
+                    prereq_flag,
+                    context,
+                    get_segment,
+                    all_flags,
+                    depth + 1,
+                    memo,
+                )
+                memo[prereq.prerequisite_flag_key] = prereq_result
+
+            # Propagate depth-exceeded / internal errors upward
+            if prereq_result.reason == EvaluationReason.ERROR:
+                result = self._serve_off(flag, EvaluationReason.ERROR)
+                memo[flag.key] = result
+                return result
+
+            if prereq_result.variation_key != prereq.expected_variation_key:
+                result = self._serve_off(
+                    flag,
+                    EvaluationReason.PREREQUISITE_FAILED,
+                    prerequisite_key=prereq.prerequisite_flag_key,
+                )
+                memo[flag.key] = result
+                return result
+
+        # Step 3: Evaluate rules in priority order
         sorted_rules = sorted(flag.rules, key=lambda r: r.priority)
         for rule in sorted_rules:
             # If rule references a segment, evaluate segment conditions
@@ -285,15 +379,43 @@ class FlagEvaluator:
                 variation_key = self._resolve_serve(rule.serve, context)
                 variation = flag.get_variation(variation_key)
                 value = variation.value if variation else None
-                return EvaluationDetail(
-                    value=value, reason=EvaluationReason.RULE_MATCH, rule_id=rule.id
+                result = EvaluationDetail(
+                    value=value,
+                    reason=EvaluationReason.RULE_MATCH,
+                    rule_id=rule.id,
+                    variation_key=variation_key,
                 )
+                memo[flag.key] = result
+                return result
 
-        # Step 3: No rules matched, use fallthrough
+        # Step 4: No rules matched, use fallthrough
         variation_key = self._resolve_serve(flag.fallthrough, context)
         variation = flag.get_variation(variation_key)
         value = variation.value if variation else None
-        return EvaluationDetail(value=value, reason=EvaluationReason.FALLTHROUGH)
+        result = EvaluationDetail(
+            value=value,
+            reason=EvaluationReason.FALLTHROUGH,
+            variation_key=variation_key,
+        )
+        memo[flag.key] = result
+        return result
+
+    def _serve_off(
+        self,
+        flag: FlagConfiguration,
+        reason: EvaluationReason,
+        *,
+        prerequisite_key: str | None = None,
+    ) -> EvaluationDetail:
+        """Build an EvaluationDetail that serves the flag's off variation."""
+        variation = flag.get_variation(flag.off_variation)
+        value = variation.value if variation else None
+        return EvaluationDetail(
+            value=value,
+            reason=reason,
+            variation_key=flag.off_variation,
+            prerequisite_key=prerequisite_key,
+        )
 
     def _resolve_serve(self, serve: ServeConfig, context: EvaluationContext) -> str:
         """Resolve which variation key to serve.

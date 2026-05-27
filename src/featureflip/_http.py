@@ -14,6 +14,7 @@ from featureflip.models import (
     ConditionOperator,
     FlagConfiguration,
     FlagType,
+    Prerequisite,
     Segment,
     ServeConfig,
     ServeType,
@@ -160,6 +161,13 @@ class HttpClient:
             rules=[self._parse_rule(r) for r in data.get("rules", [])],
             fallthrough=self._parse_serve(data["fallthrough"]),
             off_variation=data["offVariation"],
+            prerequisites=[
+                Prerequisite(
+                    prerequisite_flag_key=p["prerequisiteFlagKey"],
+                    expected_variation_key=p["expectedVariationKey"],
+                )
+                for p in data.get("prerequisites", []) or []
+            ],
         )
 
     def _parse_rule(self, data: dict[str, Any]) -> TargetingRule:

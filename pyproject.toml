@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "featureflip"
-version = "2.0.0"
+version = "2.1.0"
 description = "Python SDK for Featureflip - a feature flag SaaS platform"
 readme = "README.md"
 license = "Apache-2.0"

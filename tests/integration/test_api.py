@@ -711,3 +711,90 @@ class TestMultipleFlagEvaluations:
             assert string_result == "value-a"
             assert disabled_result is False
             assert unknown_result == "fallback"
+
+
+# Mock flag with a prerequisite that points at "test-flag" expecting "on"
+MOCK_FLAG_WITH_PREREQ = {
+    "key": "main-flag",
+    "version": 1,
+    "type": "boolean",
+    "enabled": True,
+    "variations": [
+        {"key": "on", "value": True},
+        {"key": "off", "value": False},
+    ],
+    "rules": [],
+    "fallthrough": {"type": "fixed", "variation": "on"},
+    "offVariation": "off",
+    "prerequisites": [
+        {"prerequisiteFlagKey": "test-flag", "expectedVariationKey": "on"}
+    ],
+}
+
+# Same shape but pointing at the disabled flag → prereq cannot be satisfied
+MOCK_FLAG_WITH_FAILING_PREREQ = {
+    **MOCK_FLAG_WITH_PREREQ,
+    "key": "main-flag-failing",
+    "prerequisites": [
+        {"prerequisiteFlagKey": "disabled-flag", "expectedVariationKey": "on"}
+    ],
+}
+
+MOCK_FLAGS_RESPONSE_WITH_PREREQS = {
+    "flags": [
+        MOCK_BOOLEAN_FLAG,
+        MOCK_STRING_FLAG,
+        MOCK_DISABLED_FLAG,
+        MOCK_FLAG_WITH_PREREQ,
+        MOCK_FLAG_WITH_FAILING_PREREQ,
+    ]
+}
+
+
+class TestPrerequisiteEvaluation:
+    """Tests verifying prerequisites are honored end-to-end (wire format → evaluator)."""
+
+    @respx.mock
+    def test_satisfied_prerequisite_evaluates_main_flag(
+        self, no_events_config: Config
+    ) -> None:
+        """When the prerequisite serves the expected variation, the main flag
+        falls through to its fallthrough."""
+        from featureflip import EvaluationReason
+
+        respx.get("https://eval.featureflip.io/v1/sdk/flags").mock(
+            return_value=httpx.Response(200, json=MOCK_FLAGS_RESPONSE_WITH_PREREQS)
+        )
+
+        with FeatureflipClient(
+            sdk_key="test-sdk-key", config=no_events_config
+        ) as client:
+            detail = client.variation_detail(
+                "main-flag", {"user_id": "123"}, default=False
+            )
+            assert detail.value is True
+            assert detail.reason == EvaluationReason.FALLTHROUGH
+            assert detail.prerequisite_key is None
+
+    @respx.mock
+    def test_unsatisfied_prerequisite_serves_off_with_prerequisite_key(
+        self, no_events_config: Config
+    ) -> None:
+        """When the prerequisite cannot be satisfied (disabled flag), the main
+        flag returns its off variation with reason PREREQUISITE_FAILED and the
+        prerequisite_key populated."""
+        from featureflip import EvaluationReason
+
+        respx.get("https://eval.featureflip.io/v1/sdk/flags").mock(
+            return_value=httpx.Response(200, json=MOCK_FLAGS_RESPONSE_WITH_PREREQS)
+        )
+
+        with FeatureflipClient(
+            sdk_key="test-sdk-key", config=no_events_config
+        ) as client:
+            detail = client.variation_detail(
+                "main-flag-failing", {"user_id": "123"}, default=True
+            )
+            assert detail.value is False
+            assert detail.reason == EvaluationReason.PREREQUISITE_FAILED
+            assert detail.prerequisite_key == "disabled-flag"
