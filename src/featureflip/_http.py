@@ -217,7 +217,9 @@ class HttpClient:
         """
         return Condition(
             attribute=data["attribute"],
-            operator=ConditionOperator(data["operator"].lower()),
+            # The wire sends PascalCase operators (e.g. "SemverGreaterThanOrEqual");
+            # ConditionOperator._missing_ normalizes them to the snake_case members.
+            operator=ConditionOperator(data["operator"]),
             values=data["values"],
             negate=data.get("negate", False),
         )

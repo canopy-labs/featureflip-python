@@ -6,9 +6,14 @@ configurations, variations, targeting rules, and conditions.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+# Inserts a "_" before every uppercase letter that is not at the start of the
+# string, turning the wire's PascalCase operators into snake_case enum values.
+_PASCAL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 
 
 class FlagType(Enum):
@@ -47,6 +52,30 @@ class ConditionOperator(Enum):
     # Date/time comparisons
     BEFORE = "before"
     AFTER = "after"
+
+    # Semantic-version comparisons
+    SEMVER_EQUALS = "semver_equals"
+    SEMVER_GREATER_THAN = "semver_greater_than"
+    SEMVER_GREATER_THAN_OR_EQUAL = "semver_greater_than_or_equal"
+    SEMVER_LESS_THAN = "semver_less_than"
+    SEMVER_LESS_THAN_OR_EQUAL = "semver_less_than_or_equal"
+
+    @classmethod
+    def _missing_(cls, value: object) -> ConditionOperator | None:
+        """Resolve the wire's PascalCase operator names to enum members.
+
+        The evaluation API serializes operators as the C# enum member name
+        (e.g. ``"SemverGreaterThanOrEqual"``), so a bare ``.lower()`` would drop
+        the word boundaries and fail to match the snake_case values. Normalizing
+        ``PascalCase`` -> ``snake_case`` resolves single- and multi-word operators
+        alike; values that are already snake_case pass through unchanged.
+        """
+        if isinstance(value, str):
+            normalized = _PASCAL_BOUNDARY.sub("_", value).lower()
+            for member in cls:
+                if member.value == normalized:
+                    return member
+        return None
 
 
 class ConditionLogic(Enum):

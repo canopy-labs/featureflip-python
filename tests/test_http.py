@@ -6,6 +6,7 @@ from httpx import Response
 
 from featureflip._http import HttpClient
 from featureflip.config import Config
+from featureflip.models import ConditionOperator
 
 
 class TestHttpClient:
@@ -143,6 +144,70 @@ class TestHttpClient:
         assert len(flag.rules[0].condition_groups) == 1
         assert len(flag.rules[0].condition_groups[0].conditions) == 1
         assert flag.rules[0].condition_groups[0].conditions[0].attribute == "country"
+        assert route.called
+
+    @respx.mock
+    def test_get_flags_normalizes_pascalcase_operators(self, config: Config) -> None:
+        """The server sends operators in PascalCase (e.g. "SemverGreaterThanOrEqual").
+
+        Multi-word operators must round-trip to their snake_case enum members — a bare
+        ``.lower()`` collapses "GreaterThan" to "greaterthan" and fails to resolve.
+        """
+        route = respx.get("https://api.example.com/v1/sdk/flags").mock(
+            return_value=Response(
+                200,
+                json={
+                    "flags": [
+                        {
+                            "key": "versioned-flag",
+                            "version": 1,
+                            "type": "boolean",
+                            "enabled": True,
+                            "variations": [
+                                {"key": "true", "value": True},
+                                {"key": "false", "value": False},
+                            ],
+                            "rules": [
+                                {
+                                    "id": "rule-1",
+                                    "priority": 1,
+                                    "conditionGroups": [
+                                        {
+                                            "operator": "And",
+                                            "conditions": [
+                                                {
+                                                    "attribute": "age",
+                                                    "operator": "GreaterThan",
+                                                    "values": ["18"],
+                                                    "negate": False,
+                                                },
+                                                {
+                                                    "attribute": "version",
+                                                    "operator": "SemverGreaterThanOrEqual",
+                                                    "values": ["2.0"],
+                                                    "negate": False,
+                                                },
+                                            ],
+                                        }
+                                    ],
+                                    "serve": {"type": "fixed", "variation": "false"},
+                                }
+                            ],
+                            "fallthrough": {"type": "fixed", "variation": "true"},
+                            "offVariation": "false",
+                        }
+                    ]
+                },
+            )
+        )
+
+        client = HttpClient(sdk_key="test-key", config=config)
+        flags, _segments = client.get_flags()
+        client.close()
+
+        conditions = flags[0].rules[0].condition_groups[0].conditions
+        assert conditions[0].operator is ConditionOperator.GREATER_THAN
+        assert conditions[1].operator is ConditionOperator.SEMVER_GREATER_THAN_OR_EQUAL
         assert route.called
 
     @respx.mock

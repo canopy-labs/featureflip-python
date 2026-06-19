@@ -4,7 +4,13 @@
 
 ### Added
 
+- **Semantic-version condition operators.** Five new operators — `SemverEquals`, `SemverGreaterThan`, `SemverGreaterThanOrEqual`, `SemverLessThan`, `SemverLessThanOrEqual` — compare an attribute against the condition value(s) as a semantic version (https://semver.org) rather than a decimal, so `2.10.1` correctly satisfies `>= 2.0` (the numeric path mis-parsed multi-segment versions). Tolerant of a leading `v`, `+build` metadata, missing trailing segments (`2.0` == `2.0.0`), and `-prerelease` precedence; unparseable versions match nothing. A rule matches when any supplied condition value satisfies the operator, mirroring the numeric/date operators and the evaluation engine. New module: `featureflip/_semver.py`.
+
 - **Prerequisite flag support.** Flags can declare other flags as prerequisites; the flag's rules and fallthrough only run when every prerequisite serves the expected variation, otherwise the off variation is served with `EvaluationReason.PREREQUISITE_FAILED` and `prerequisite_key` set on the `EvaluationDetail`. Resolution is recursive (depth-capped at 10) with per-call memoisation. New types: `Prerequisite`, `EvaluationReason.PREREQUISITE_FAILED`. New `EvaluationDetail` fields: `variation_key`, `prerequisite_key`. New batch-eval entry point: `FlagEvaluator.evaluate_with_shared_memo(...)`.
+
+### Fixed
+
+- **Multi-word condition operators sent by the server now parse correctly.** The evaluation API serializes operators in PascalCase (e.g. `GreaterThan`, `SemverGreaterThanOrEqual`); operator parsing previously lower-cased the wire string, which collapsed the word boundaries (`GreaterThan` → `greaterthan`) and failed to resolve any multi-word operator. `ConditionOperator` now normalizes PascalCase → snake_case via `_missing_`.
 
 ## 2.0.0 — 2026-04-08
 
