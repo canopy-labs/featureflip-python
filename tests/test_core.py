@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from featureflip._core import _SharedFeatureflipCore
 from featureflip.detail import EvaluationReason
 from featureflip.models import (
@@ -82,6 +84,27 @@ class TestCoreEvaluate:
             assert core.evaluate("feature-a", {}, default=False).value is True
             assert core.evaluate("feature-b", {}, default="default").value == "v1"
             assert core.evaluate("missing", {}, default="fallback").value == "fallback"
+        finally:
+            core._release()
+
+
+class TestCoreStreamingCallbacks:
+    def test_segment_updated_refetch_replaces_store_dropping_absent_flags(self) -> None:
+        stale = _make_bool_flag("stale-flag", enabled=True, variation="on")
+        keep = _make_bool_flag("keep-flag", enabled=True, variation="on")
+        core = _SharedFeatureflipCore._create_for_testing_with_flags(
+            {stale.key: stale, keep.key: keep}
+        )
+        try:
+            # A segment.updated triggers a full re-fetch. The new snapshot no
+            # longer contains stale-flag, so it must be dropped (full replace),
+            # not merged in — otherwise a server-side delete lingers.
+            http = MagicMock()
+            http.get_flags.return_value = ([keep], [])
+            core._http_client = http
+            core._on_streaming_segment_updated()
+            assert core._get_flag("keep-flag") is not None
+            assert core._get_flag("stale-flag") is None
         finally:
             core._release()
 

@@ -15,6 +15,11 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# Ceiling for the fallback poller's exponential backoff during a sustained
+# outage. Retry-forever, but escalate the interval so a long outage doesn't keep
+# hammering the eval-api every poll_interval.
+_MAX_POLL_BACKOFF_SECONDS = 300.0
+
 
 class HttpClientProtocol(Protocol):
     """Protocol for HTTP client to enable loose coupling."""
@@ -69,13 +74,31 @@ class PollingHandler:
         logger.info("polling_stopped")
 
     def _run(self) -> None:
-        """Main polling loop."""
+        """Main polling loop.
+
+        Polls at ``poll_interval`` while healthy; on consecutive failures the
+        wait escalates exponentially (capped) so a sustained outage backs off
+        rather than hammering the eval-api at a fixed interval forever.
+        """
+        consecutive_failures = 0
         while not self._stop_event.is_set():
             try:
                 flags, segments = self._http.get_flags()
                 self._on_update(flags, segments)
+                consecutive_failures = 0
                 logger.debug("polling_success", flag_count=len(flags))
             except Exception as e:
+                consecutive_failures += 1
                 logger.warning("polling_error", error=str(e))
                 self._on_error(e)
-            self._stop_event.wait(self._config.poll_interval)
+            self._stop_event.wait(self._backoff_delay(consecutive_failures))
+
+    def _backoff_delay(self, consecutive_failures: int) -> float:
+        """Base interval on success/first failure, then capped exponential."""
+        if consecutive_failures <= 1:
+            return self._config.poll_interval
+        # Cap the exponent so a very high failure count can't overflow the float
+        # multiply; the result is capped anyway.
+        exponent = min(consecutive_failures - 1, 20)
+        delay: float = self._config.poll_interval * (2**exponent)
+        return min(delay, _MAX_POLL_BACKOFF_SECONDS)

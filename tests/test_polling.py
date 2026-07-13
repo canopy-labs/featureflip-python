@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from featureflip._polling import PollingHandler
+from featureflip._polling import _MAX_POLL_BACKOFF_SECONDS, PollingHandler
 from featureflip.config import Config
 from featureflip.models import (
     FlagConfiguration,
@@ -135,6 +135,22 @@ class TestPollingHandler:
         handler.stop()
 
         assert mock_http.get_flags.call_count > initial_count
+
+    def test_backoff_escalates_on_consecutive_failures_and_caps(
+        self, config: Config, mock_http: MagicMock, on_update: MagicMock, on_error: MagicMock
+    ) -> None:
+        """The fallback poller must back off during a sustained outage, not poll
+        at a fixed interval forever (GAP-4: retry forever *with backoff*)."""
+        handler = PollingHandler(
+            http_client=mock_http, config=config, on_update=on_update, on_error=on_error
+        )
+        # Success (and the first failure) poll at the base interval; consecutive
+        # failures escalate exponentially, capped.
+        assert handler._backoff_delay(0) == config.poll_interval
+        assert handler._backoff_delay(1) == config.poll_interval
+        assert handler._backoff_delay(2) == config.poll_interval * 2
+        assert handler._backoff_delay(3) == config.poll_interval * 4
+        assert handler._backoff_delay(1000) == _MAX_POLL_BACKOFF_SECONDS
 
     def test_continues_after_error(
         self, config: Config, on_update: MagicMock, on_error: MagicMock

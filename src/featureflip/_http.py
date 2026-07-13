@@ -81,10 +81,20 @@ class HttpClient:
         logger.debug("Fetching flags from API")
         response = self._client.get("/v1/sdk/flags")
         response.raise_for_status()
-        data = response.json()
+        flags, segments = self.parse_flags_response(response.json())
+        logger.debug("Fetched flags", flag_count=len(flags), segment_count=len(segments))
+        return flags, segments
+
+    def parse_flags_response(
+        self, data: dict[str, Any]
+    ) -> tuple[list[FlagConfiguration], list[Segment]]:
+        """Parse a GET /v1/sdk/flags-shaped snapshot into models.
+
+        Reused for the connect-time ``sync`` SSE snapshot, which carries the
+        identical payload shape inline (no extra HTTP round-trip).
+        """
         flags = [self._parse_flag(f) for f in data.get("flags", [])]
         segments = [self._parse_segment(s) for s in data.get("segments", [])]
-        logger.debug("Fetched flags", flag_count=len(flags), segment_count=len(segments))
         return flags, segments
 
     def get_flag(self, key: str) -> FlagConfiguration:

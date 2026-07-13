@@ -299,8 +299,13 @@ class _SharedFeatureflipCore:
             if self._http_client is None:
                 return
             flags, segments = self._http_client.get_flags()
-            self._update_flags(flags)
-            self._update_segments(segments)
+            # get_flags() returns the full current snapshot, so REPLACE the store
+            # (drop flags/segments deleted server-side) rather than per-key
+            # merging — otherwise a delete only lands via a later flag.deleted
+            # delta or a poll/sync full-replace. Mirrors _on_polling_update.
+            with self._flags_lock:
+                self._flags = {flag.key: flag for flag in flags}
+                self._segments = {segment.key: segment for segment in segments}
         except Exception as e:
             logger.warning("streaming_segment_refetch_error", error=str(e))
 
@@ -323,15 +328,18 @@ class _SharedFeatureflipCore:
 
     def _start_streaming(self) -> None:
         # _start_streaming is only called from the production __init__ path,
-        # which has already validated that sdk_key is not None.
+        # which has already validated that sdk_key and http_client are not None.
         assert self._sdk_key is not None
+        assert self._http_client is not None
         self._streaming_handler = StreamingHandler(
             sdk_key=self._sdk_key,
             config=self._config,
+            http_client=self._http_client,
             on_flag_updated=self._on_streaming_flag_updated,
             on_flag_deleted=self._on_streaming_flag_deleted,
             on_segment_updated=self._on_streaming_segment_updated,
             on_error=self._on_streaming_error,
+            on_update=self._on_polling_update,
         )
         self._streaming_handler.start()
 

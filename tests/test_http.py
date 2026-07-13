@@ -14,6 +14,38 @@ class TestHttpClient:
     def config(self) -> Config:
         return Config(base_url="https://api.example.com")
 
+    def test_parse_flags_response_parses_flags_and_segments(self, config: Config) -> None:
+        client = HttpClient(sdk_key="test-key", config=config)
+        data = {
+            "flags": [
+                {
+                    "key": "flag-a",
+                    "version": 1,
+                    "type": "boolean",
+                    "enabled": True,
+                    "variations": [
+                        {"key": "on", "value": True},
+                        {"key": "off", "value": False},
+                    ],
+                    "rules": [],
+                    "fallthrough": {"type": "fixed", "variation": "on"},
+                    "offVariation": "off",
+                }
+            ],
+            "segments": [],
+        }
+
+        flags, segments = client.parse_flags_response(data)
+
+        assert [f.key for f in flags] == ["flag-a"]
+        assert segments == []
+
+    def test_parse_flags_response_tolerates_missing_keys(self, config: Config) -> None:
+        client = HttpClient(sdk_key="test-key", config=config)
+        flags, segments = client.parse_flags_response({})
+        assert flags == []
+        assert segments == []
+
     @respx.mock
     def test_get_flags(self, config: Config) -> None:
         route = respx.get("https://api.example.com/v1/sdk/flags").mock(
