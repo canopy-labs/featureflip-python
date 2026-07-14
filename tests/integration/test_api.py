@@ -7,6 +7,7 @@ and update mechanisms (polling).
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -456,6 +457,112 @@ class TestEventTracking:
         with FeatureflipClient(sdk_key="test-sdk-key", config=test_config) as client:
             client.track("event", {"user_id": "123"})
             client.flush()  # Should not raise
+
+
+class TestEventWireShape:
+    """Events must be sent in the backend SdkEventDto shape (top-level userId /
+    variation), matching the JS SDK. The backend has no context/value/reason/ruleId
+    fields, so those keys are silently dropped and UserId/Variation bind to null
+    unless the SDK populates them client-side. Regression guard for #1920.
+    """
+
+    @staticmethod
+    def _first_event(events_route: respx.Route) -> dict:
+        payload = json.loads(events_route.calls[0].request.read())
+        assert isinstance(payload, dict)
+        assert isinstance(payload["events"], list)
+        return payload["events"][0]
+
+    @respx.mock
+    def test_evaluation_event_has_top_level_userid_and_variation(
+        self, test_config: Config
+    ) -> None:
+        respx.get("https://eval.featureflip.io/v1/sdk/flags").mock(
+            return_value=httpx.Response(200, json=MOCK_FLAGS_RESPONSE)
+        )
+        events_route = respx.post("https://eval.featureflip.io/v1/sdk/events").mock(
+            return_value=httpx.Response(202)
+        )
+
+        with FeatureflipClient(sdk_key="test-sdk-key", config=test_config) as client:
+            client.variation("test-flag", {"user_id": "123"}, default=False)
+            client.flush()
+
+        event = self._first_event(events_route)
+        assert event["type"] == "Evaluation"
+        assert event["flagKey"] == "test-flag"
+        assert event["userId"] == "123"
+        # served variation of the boolean fallthrough ("on")
+        assert event["variation"] == "on"
+        # backend DTO has no such fields — must not be sent
+        assert "context" not in event
+        assert "value" not in event
+        assert "reason" not in event
+        assert "ruleId" not in event
+
+    @respx.mock
+    def test_evaluation_event_resolves_userid_camelcase_alias(
+        self, test_config: Config
+    ) -> None:
+        respx.get("https://eval.featureflip.io/v1/sdk/flags").mock(
+            return_value=httpx.Response(200, json=MOCK_FLAGS_RESPONSE)
+        )
+        events_route = respx.post("https://eval.featureflip.io/v1/sdk/events").mock(
+            return_value=httpx.Response(202)
+        )
+
+        with FeatureflipClient(sdk_key="test-sdk-key", config=test_config) as client:
+            # camelCase alias — a documented-valid keyed context
+            client.variation("test-flag", {"userId": "alice"}, default=False)
+            client.flush()
+
+        event = self._first_event(events_route)
+        assert event["userId"] == "alice"
+
+    @respx.mock
+    def test_track_event_has_top_level_userid(self, test_config: Config) -> None:
+        respx.get("https://eval.featureflip.io/v1/sdk/flags").mock(
+            return_value=httpx.Response(200, json=MOCK_FLAGS_RESPONSE)
+        )
+        events_route = respx.post("https://eval.featureflip.io/v1/sdk/events").mock(
+            return_value=httpx.Response(202)
+        )
+
+        with FeatureflipClient(sdk_key="test-sdk-key", config=test_config) as client:
+            client.track("signup", {"userId": "alice"}, metadata={"plan": "pro"})
+            client.flush()
+
+        event = self._first_event(events_route)
+        assert event["type"] == "Custom"
+        assert event["flagKey"] == "signup"
+        assert event["userId"] == "alice"
+        assert event["metadata"] == {"plan": "pro"}
+        assert "context" not in event
+
+    @respx.mock
+    def test_identify_promotes_userid_and_strips_it_from_metadata(
+        self, test_config: Config
+    ) -> None:
+        respx.get("https://eval.featureflip.io/v1/sdk/flags").mock(
+            return_value=httpx.Response(200, json=MOCK_FLAGS_RESPONSE)
+        )
+        events_route = respx.post("https://eval.featureflip.io/v1/sdk/events").mock(
+            return_value=httpx.Response(202)
+        )
+
+        with FeatureflipClient(sdk_key="test-sdk-key", config=test_config) as client:
+            client.identify({"userId": "alice", "plan": "pro"})
+            client.flush()
+
+        event = self._first_event(events_route)
+        assert event["type"] == "Identify"
+        assert event["flagKey"] == "$identify"
+        assert event["userId"] == "alice"
+        # identity is promoted to userId, not buried in metadata
+        assert event["metadata"] == {"plan": "pro"}
+        assert "userId" not in event["metadata"]
+        assert "user_id" not in event["metadata"]
+        assert "context" not in event
 
 
 class TestPollingUpdates:

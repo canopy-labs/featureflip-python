@@ -331,8 +331,11 @@ class TestIdentify:
             client._core._event_processor.queue_event.assert_called_once()
             event = client._core._event_processor.queue_event.call_args[0][0]
             assert event["type"] == "Identify"
-            assert event["context"]["user_id"] == "123"
-            assert event["context"]["email"] == "test@example.com"
+            # user id is promoted to the top-level backend DTO field; the
+            # remaining attributes land in metadata (see #1920)
+            assert event["userId"] == "123"
+            assert event["metadata"]["email"] == "test@example.com"
+            assert "context" not in event
             client.close()
 
     def test_identify_event_includes_flagkey(self) -> None:
@@ -702,13 +705,21 @@ class TestEvaluationEventKeys:
             assert "flagKey" in event, f"Event should use 'flagKey' but has keys: {list(event.keys())}"
             assert "flag_key" not in event, "Event should not use snake_case 'flag_key'"
             assert event["flagKey"] == "test-flag"
+            # user id is promoted to the top-level backend DTO field
+            assert event["userId"] == "123"
             client.close()
 
-    def test_evaluation_event_uses_camelcase_rule_id(self) -> None:
-        """_queue_evaluation_event must use 'ruleId' not 'rule_id'."""
+    def test_evaluation_event_matches_backend_dto_shape(self) -> None:
+        """Evaluation events carry only the backend SdkEventDto fields.
+
+        The backend maps SdkEventDto -> SdkEvent with type/flagKey/userId/variation/
+        timestamp/metadata/prerequisiteKey and nothing else (see
+        Evaluation.Api Controllers/SdkController.RecordEvents). Sending context/value/
+        reason/ruleId is dead weight silently dropped by System.Text.Json. Regression
+        guard for #1920.
+        """
         with patch("featureflip._core.HttpClient") as mock_http:
-            flag = create_test_flag()
-            mock_http.return_value.get_flags.return_value = ([flag], [])
+            mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
 
             client = FeatureflipClient(
                 sdk_key="test-key",
@@ -716,17 +727,19 @@ class TestEvaluationEventKeys:
             )
             client._core._event_processor = MagicMock()
 
-            # Call _queue_evaluation_event directly with a rule_id
             client._queue_evaluation_event(
                 key="test-flag",
-                value=True,
                 context={"user_id": "123"},
-                reason=EvaluationReason.RULE_MATCH,
-                rule_id="rule-abc",
+                variation_key="on",
             )
 
             event = client._core._event_processor.queue_event.call_args[0][0]
-            assert "ruleId" in event, f"Event should use 'ruleId' but has keys: {list(event.keys())}"
-            assert "rule_id" not in event, "Event should not use snake_case 'rule_id'"
-            assert event["ruleId"] == "rule-abc"
+            assert event["type"] == "Evaluation"
+            assert event["flagKey"] == "test-flag"
+            assert event["userId"] == "123"
+            assert event["variation"] == "on"
+            assert "timestamp" in event
+            # non-DTO fields must not be sent
+            for dead in ("context", "value", "reason", "ruleId", "rule_id"):
+                assert dead not in event, f"Event should not carry '{dead}'"
             client.close()

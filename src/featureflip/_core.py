@@ -37,6 +37,19 @@ logger = structlog.get_logger()
 T = TypeVar("T")
 
 
+def _resolve_user_id(context: dict[str, Any]) -> str | None:
+    """Resolve the built-in user id from a raw context dict.
+
+    Honors the ``user_id`` / ``userId`` alias (universal across the engine and
+    every SDK) so a caller passing either spelling gets the same top-level
+    ``userId`` on analytics events. Returns ``None`` when neither is present.
+    """
+    raw = context.get("user_id")
+    if raw is None:
+        raw = context.get("userId")
+    return str(raw) if raw is not None else None
+
+
 class _SharedFeatureflipCore:
     """Internal shared core owning all expensive resources of a FeatureflipClient.
 
@@ -373,10 +386,13 @@ class _SharedFeatureflipCore:
         """Queue a custom event."""
         if self._test_mode_values is not None or self._event_processor is None:
             return
+        # Send the backend SdkEventDto shape: top-level userId, no `context`.
+        # See apps/evaluation-api Controllers/SdkController.RecordEvents — the
+        # backend has no context/value/reason field, so anything else is dropped.
         event = {
             "type": "Custom",
             "flagKey": event_name,
-            "context": context or {},
+            "userId": _resolve_user_id(context or {}),
             "metadata": metadata or {},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -386,10 +402,19 @@ class _SharedFeatureflipCore:
         """Send user attributes for segment building."""
         if self._test_mode_values is not None or self._event_processor is None:
             return
+        # Promote the user id to the top-level userId field and put the remaining
+        # attributes in metadata (stripping both alias spellings so the identity
+        # isn't duplicated inside the metadata bag).
+        attributes = {
+            k: v
+            for k, v in (context or {}).items()
+            if k not in ("user_id", "userId")
+        }
         event = {
             "type": "Identify",
             "flagKey": "$identify",
-            "context": context or {},
+            "userId": _resolve_user_id(context or {}),
+            "metadata": attributes,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self._event_processor.queue_event(event)
@@ -402,24 +427,25 @@ class _SharedFeatureflipCore:
     def queue_evaluation_event(
         self,
         key: str,
-        value: Any,
         context: dict[str, Any],
-        reason: EvaluationReason,
-        rule_id: str | None = None,
+        variation_key: str | None,
     ) -> None:
-        """Queue an evaluation event (called by the handle's variation() method)."""
+        """Queue an evaluation event (called by the handle's variation() method).
+
+        Emits the backend SdkEventDto shape — top-level ``userId`` and
+        ``variation`` — mirroring the JS SDK. The backend has no context/value/
+        reason/ruleId fields, so they are not sent (System.Text.Json would drop
+        them and bind UserId/Variation to null; see #1920).
+        """
         if self._event_processor is None:
             return
         event: dict[str, Any] = {
             "type": "Evaluation",
             "flagKey": key,
-            "value": value,
-            "context": context,
-            "reason": reason.value,
+            "userId": _resolve_user_id(context or {}),
+            "variation": variation_key,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        if rule_id is not None:
-            event["ruleId"] = rule_id
         self._event_processor.queue_event(event)
 
     # --- Shutdown ---

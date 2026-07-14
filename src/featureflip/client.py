@@ -103,10 +103,8 @@ class FeatureflipClient:
             if track:
                 self._core.queue_evaluation_event(
                     key=key,
-                    value=value,
                     context=context or {},
-                    reason=detail.reason,
-                    rule_id=detail.rule_id,
+                    variation_key=detail.variation_key,
                 )
             return cast("T", value)
         except Exception as e:
@@ -254,20 +252,15 @@ class FeatureflipClient:
     def _queue_evaluation_event(
         self,
         key: str,
-        value: Any,
         context: dict[str, Any],
-        reason: EvaluationReason,
-        rule_id: str | None = None,
+        variation_key: str | None = None,
     ) -> None:
         """Queue an evaluation event. Delegates to the shared core.
 
-        Preserved for backwards compatibility with existing tests that call
-        this method directly on the client.
+        Preserved for tests that call this method directly on the client.
         """
         self._core.queue_evaluation_event(
             key=key,
-            value=value,
             context=context,
-            reason=reason,
-            rule_id=rule_id,
+            variation_key=variation_key,
         )
