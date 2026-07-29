@@ -11,6 +11,7 @@ from featureflip.exceptions import (
     FeatureflipError,
     InitializationError,
 )
+from featureflip.inspector import EvaluationEvent, EvaluationInspector
 from featureflip.models import (
     Condition,
     ConditionGroup,
@@ -36,6 +37,8 @@ __all__: list[str] = [
     "ConfigurationError",
     "EvaluationContext",
     "EvaluationDetail",
+    "EvaluationEvent",
+    "EvaluationInspector",
     "EvaluationReason",
     "FeatureflipClient",
     "FeatureflipError",

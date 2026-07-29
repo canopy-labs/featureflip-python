@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import structlog
 
 from featureflip._core import _get_or_create_core, _SharedFeatureflipCore
 from featureflip.config import Config
 from featureflip.detail import EvaluationDetail, EvaluationReason
+
+if TYPE_CHECKING:
+    from featureflip.inspector import EvaluationInspector
 
 logger = structlog.get_logger()
 
@@ -201,7 +204,11 @@ class FeatureflipClient:
     # --- Test-stub factory ---
 
     @classmethod
-    def for_testing(cls, flags: dict[str, Any]) -> FeatureflipClient:
+    def for_testing(
+        cls,
+        flags: dict[str, Any],
+        inspectors: list[EvaluationInspector] | None = None,
+    ) -> FeatureflipClient:
         """Create a test client with fixed flag values.
 
         The test client:
@@ -213,6 +220,11 @@ class FeatureflipClient:
 
         Args:
             flags: Dictionary mapping flag keys to their values.
+            inspectors: Optional evaluation inspectors, so code under test that
+                relies on inspector side effects can be unit-tested against a
+                stub client. Omitted by default — every existing call site is
+                unaffected. Inspectors fire on both stub exit paths (a stub hit
+                and a stub miss).
 
         Returns:
             A test client instance.
@@ -224,14 +236,29 @@ class FeatureflipClient:
             ... })
             >>> client.variation("feature-a", {}, default=False)
             True
+
+        Example with an inspector:
+            >>> seen = []
+            >>> client = FeatureflipClient.for_testing(
+            ...     {"feature-a": True}, inspectors=[seen.append]
+            ... )
+            >>> client.variation("feature-a", {}, default=False)
+            True
+            >>> seen[0].flag_key
+            'feature-a'
         """
         # Create instance without calling __init__ (same technique the original
         # used). Then wire up a standalone test-stub core that never enters
         # _LIVE_CORES (it has no sdk_key).
+        #
+        # NOTE: this bypasses __init__ entirely, so any change to the client's
+        # constructor shape (new instance attribute, new core wiring) must be
+        # mirrored here or test clients silently drift from real ones — which
+        # is exactly how `inspectors` came to be dropped on this path.
         instance = object.__new__(cls)
         instance._core = _SharedFeatureflipCore(
             sdk_key=None,
-            config=Config(),
+            config=Config(inspectors=list(inspectors) if inspectors else []),
             test_mode_values=dict(flags),
         )
         instance._closed = False

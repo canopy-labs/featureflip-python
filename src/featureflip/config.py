@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from featureflip.inspector import EvaluationInspector
 
 
 @dataclass
@@ -19,6 +23,13 @@ class Config:
         flush_interval: Interval in seconds for flushing event batches.
         flush_batch_size: Maximum number of events in a batch before flushing.
         init_timeout: Timeout in seconds for client initialization.
+        inspectors: Callables invoked synchronously with an ``EvaluationEvent``
+            on every flag evaluation. Void observers — the return value is
+            ignored, and a raising inspector cannot affect the evaluated value.
+            Deliberately excluded from the config-equality comparison (see
+            ``_core._configs_equal``): callbacks aren't structurally comparable
+            and a differing callback must not trigger the "different options"
+            warning.
     """
 
     base_url: str = "https://eval.featureflip.io"
@@ -30,6 +41,7 @@ class Config:
     flush_interval: float = 30.0
     flush_batch_size: int = 100
     init_timeout: float = 10.0
+    inspectors: list[EvaluationInspector] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate and normalize configuration values."""

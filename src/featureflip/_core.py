@@ -28,8 +28,10 @@ from featureflip.context import EvaluationContext
 from featureflip.detail import EvaluationDetail, EvaluationReason
 from featureflip.evaluation import FlagEvaluator
 from featureflip.exceptions import InitializationError
+from featureflip.inspector import EvaluationEvent
 
 if TYPE_CHECKING:
+    from featureflip.inspector import EvaluationInspector
     from featureflip.models import FlagConfiguration, Segment
 
 logger = structlog.get_logger()
@@ -82,6 +84,13 @@ class _SharedFeatureflipCore:
 
         self._sdk_key = sdk_key
         self._config = config
+
+        # Filter to callables defensively — Python callers bypass the type
+        # hints, and a non-callable entry must be dropped at construction
+        # rather than blowing up on the evaluation hot path.
+        self._inspectors: list[EvaluationInspector] = [
+            inspector for inspector in (config.inspectors or []) if callable(inspector)
+        ]
 
         self._test_mode_values = test_mode_values
         self._test_values: dict[str, Any] = dict(test_mode_values) if test_mode_values else {}
@@ -140,12 +149,21 @@ class _SharedFeatureflipCore:
         return cls(sdk_key=None, config=Config(), test_mode_flags=flags)
 
     @classmethod
-    def _create_for_testing_stub(cls, flags: dict[str, Any]) -> _SharedFeatureflipCore:
+    def _create_for_testing_stub(
+        cls,
+        flags: dict[str, Any],
+        inspectors: list[EvaluationInspector] | None = None,
+    ) -> _SharedFeatureflipCore:
         """Create a test-stub core that returns fixed values (no flag evaluation).
 
         This is the backing implementation for ``FeatureflipClient.for_testing``.
+        ``inspectors`` is optional so existing call sites are unaffected.
         """
-        return cls(sdk_key=None, config=Config(), test_mode_values=flags)
+        return cls(
+            sdk_key=None,
+            config=Config(inspectors=list(inspectors) if inspectors else []),
+            test_mode_values=flags,
+        )
 
     # --- Refcount ---
 
@@ -198,7 +216,27 @@ class _SharedFeatureflipCore:
 
         In test-stub mode, returns the fixed value for the given key (or a
         FLAG_NOT_FOUND detail if the key isn't in the stub map).
+
+        This is the single evaluation choke point — every ``variation`` /
+        ``variation_detail`` call funnels through it — so the registered
+        evaluation inspectors are notified here, exactly once per call, with
+        the value and reason the caller actually receives. ``_evaluate``
+        resolves a complete detail on *every* exit path (test-stub hit,
+        test-stub miss, flag-not-found, evaluated result, ``None``-value
+        default substitution, and the error branch), so notifying once around
+        it instruments them all with no risk of a double fire.
         """
+        detail = self._evaluate(key, context, default)
+        self._notify_inspectors(key, context, detail)
+        return detail
+
+    def _evaluate(
+        self,
+        key: str,
+        context: dict[str, Any],
+        default: T,
+    ) -> EvaluationDetail:
+        """Resolve the evaluation detail. Never raises — see ``evaluate``."""
         try:
             # Test-stub mode: short-circuit to fixed values
             if self._test_mode_values is not None:
@@ -220,6 +258,21 @@ class _SharedFeatureflipCore:
             detail = self._evaluator.evaluate(
                 flag, eval_context, self._get_segment, all_flags=all_flags
             )
+
+            # Malformed config: the evaluator selected a variation key the flag
+            # does not define (e.g. a fallthrough/rule naming a since-deleted
+            # variation). Degrade to the caller's default and report ERROR,
+            # mirroring the engine's ServeVariation + the C#/Java SDKs (#1989).
+            # A variation that genuinely exists with a None value is NOT this
+            # case — hence the key lookup rather than a ``value is None`` check.
+            if detail.variation_key and flag.get_variation(detail.variation_key) is None:
+                return EvaluationDetail(
+                    value=default,
+                    reason=EvaluationReason.ERROR,
+                    rule_id=detail.rule_id,
+                    variation_key=detail.variation_key,
+                    prerequisite_key=detail.prerequisite_key,
+                )
 
             if detail.value is None:
                 return EvaluationDetail(
@@ -243,6 +296,57 @@ class _SharedFeatureflipCore:
         if self._test_mode_values is None:
             raise RuntimeError("set_test_value() can only be called on a test-stub core")
         self._test_values[key] = value
+
+    # --- Evaluation inspectors ---
+
+    def _notify_inspectors(
+        self,
+        flag_key: str,
+        context: dict[str, Any],
+        detail: EvaluationDetail,
+    ) -> None:
+        """Fire the registered evaluation inspectors for one evaluation.
+
+        Never raises. Both halves are isolated:
+
+        * Building the event must never disturb evaluation — a caller passing a
+          non-mapping ``context`` (or mutating its own dict concurrently) would
+          otherwise make ``dict(context)`` throw *out of* ``evaluate`` and
+          silently downgrade the caller to their default, purely because an
+          inspector happened to be registered. On failure the notification is
+          skipped and logged.
+        * A throwing inspector is isolated: it neither changes the value the
+          caller receives nor stops the remaining inspectors from firing; the
+          failure is logged and swallowed.
+
+        The event-build guard lives *here*, not around ``_evaluate`` in
+        ``evaluate`` — wrapping the call site would route the failure into the
+        evaluation error handling and could double-fire the inspectors.
+        """
+        # Hot-path guard: with no inspectors registered, allocate nothing.
+        if not self._inspectors:
+            return
+
+        try:
+            event = EvaluationEvent(
+                flag_key=flag_key,
+                # Copy so a buggy inspector can't mutate the caller's context.
+                context=dict(context or {}),
+                value=detail.value,
+                reason=detail.reason,
+                variation_key=detail.variation_key,
+                rule_id=detail.rule_id,
+                prerequisite_key=detail.prerequisite_key,
+            )
+        except Exception as e:
+            logger.warning("inspector_event_build_error", key=flag_key, error=str(e))
+            return
+
+        for inspector in self._inspectors:
+            try:
+                inspector(event)
+            except Exception as e:
+                logger.warning("inspector_error", key=flag_key, error=str(e))
 
     # --- Internal flag store ---
 
@@ -598,7 +702,12 @@ def _reset_for_testing() -> None:
 
 
 def _configs_equal(a: Config, b: Config) -> bool:
-    """Compare two Config objects by value across all 9 fields."""
+    """Compare two Config objects by value across the 9 comparable fields.
+
+    ``inspectors`` is deliberately excluded: callbacks aren't structurally
+    comparable, and a differing callback must not trigger the "different
+    options" warning for a shared core.
+    """
     return (
         a.base_url == b.base_url
         and a.connect_timeout == b.connect_timeout
