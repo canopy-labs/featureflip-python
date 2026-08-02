@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.4.1 — 2026-08-02
+
+### Fixed
+
+- The `User-Agent` reports the SDK's real version, read from the installed package metadata rather than a hardcoded literal. It had been pinned to `0.1.0` since the first release, so every request from a 2.x client identified itself as pre-1.0 (#2141).
+- `featureflip.__version__` reports the real version too. It had been stuck at `2.0.0`.
+
 ## 2.4.0 — 2026-07-29
 
 ### Added

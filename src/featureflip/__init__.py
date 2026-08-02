@@ -1,7 +1,6 @@
 """Featureflip Python SDK."""
 
-__version__ = "2.0.0"
-
+from featureflip._version import __version__
 from featureflip.client import FeatureflipClient
 from featureflip.config import Config
 from featureflip.context import EvaluationContext

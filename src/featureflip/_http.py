@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import structlog
 
+from featureflip._version import USER_AGENT
 from featureflip.models import (
     Condition,
     ConditionGroup,
@@ -51,7 +52,7 @@ class HttpClient:
             ),
             headers={
                 "Authorization": sdk_key,
-                "User-Agent": "featureflip-python/0.1.0",
+                "User-Agent": USER_AGENT,
             },
         )
 
