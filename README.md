@@ -151,4 +151,4 @@ mypy src/featureflip --strict
 
 ## License
 
-MIT
+Apache-2.0
