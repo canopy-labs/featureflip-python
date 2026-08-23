@@ -150,7 +150,11 @@ class FeatureflipClient:
         self._core.track(event_name, context, metadata)
 
     def identify(self, context: dict[str, Any]) -> None:
-        """Send user attributes for segment building."""
+        """Record an identify event for analytics.
+
+        Does not affect flag evaluation: targeting rules and segments are matched
+        against the context passed to each variation call.
+        """
         if self._closed:
             return
         self._core.identify(context)

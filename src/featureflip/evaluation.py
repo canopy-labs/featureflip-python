@@ -120,6 +120,16 @@ class FlagEvaluator:
 
         result = self._evaluate_operator(condition.operator, str_value, values)
 
+        # Issue #2262: an unrecognised operator fails CLOSED. ``not None`` is True
+        # in Python, so without this guard a negated unknown operator would match
+        # every user and roll the flag out to 100% of traffic. Every
+        # ConditionOperator member is covered above and _http.py rejects an unknown
+        # operator string at deserialization, so this is defensive here — but it
+        # keeps the contract identical to the string-typed SDKs (js/go/ruby/php),
+        # where the same input IS reachable over the wire.
+        if result is None:
+            return False
+
         return not result if condition.negate else result
 
     def _evaluate_numeric_equality(self, condition: Condition, attr_value: float) -> bool:
@@ -168,8 +178,8 @@ class FlagEvaluator:
             return False
 
     def _evaluate_operator(
-        self, operator: ConditionOperator, value: str, targets: list[str]
-    ) -> bool:
+        self, operator: ConditionOperator | str, value: str, targets: list[str]
+    ) -> bool | None:
         """Evaluate an operator against a value and targets.
 
         Args:
@@ -233,8 +243,11 @@ class FlagEvaluator:
             case ConditionOperator.SEMVER_LESS_THAN_OR_EQUAL:
                 return any(compare_semver(value, t, "<=") for t in targets)
             case _:
+                # Unrecognised operator — "cannot evaluate", not "did not match".
+                # Returning None (rather than False) keeps the two distinguishable
+                # so negate is not applied to an inability (#2262).
                 logger.warning("unknown_operator", operator=operator)
-                return False
+                return None
 
     def _compare_numeric(self, value: str, target: str, op: str) -> bool:
         """Compare two values as numbers.

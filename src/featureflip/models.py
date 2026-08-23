@@ -125,13 +125,16 @@ class Condition:
 
     Attributes:
         attribute: The context attribute to evaluate (e.g., "country", "user_id").
-        operator: The comparison operator to use.
+        operator: The comparison operator to use. Typed to also admit a raw ``str``:
+            an operator name this SDK version does not recognise is retained
+            verbatim rather than failing the whole config parse (#2372), and the
+            evaluator fails it closed (#2262).
         values: The values to compare against.
         negate: If True, the condition result is inverted.
     """
 
     attribute: str
-    operator: ConditionOperator
+    operator: ConditionOperator | str
     values: list[Any]
     negate: bool = False
 
@@ -296,7 +299,11 @@ class FlagConfiguration:
     Attributes:
         key: Unique identifier for the flag.
         version: Version number of the configuration.
-        type: The type of value this flag returns.
+        type: The type of value this flag returns. Typed to also admit a raw
+            ``str``: a flag type this SDK version does not recognise is retained
+            verbatim rather than failing the whole config parse (#2395). Nothing
+            evaluates this field, so an unrecognised value has no effect beyond
+            the diagnostic emitted at parse time.
         enabled: Whether the flag is enabled for evaluation.
         variations: All possible variations for this flag.
         rules: Targeting rules evaluated in priority order.
@@ -308,7 +315,7 @@ class FlagConfiguration:
 
     key: str
     version: int
-    type: FlagType
+    type: FlagType | str
     enabled: bool
     variations: tuple[Variation, ...]
     rules: tuple[TargetingRule, ...]
@@ -323,7 +330,7 @@ class FlagConfiguration:
         self,
         key: str,
         version: int,
-        type: FlagType,
+        type: FlagType | str,
         enabled: bool,
         variations: list[Variation] | tuple[Variation, ...],
         rules: list[TargetingRule] | tuple[TargetingRule, ...],

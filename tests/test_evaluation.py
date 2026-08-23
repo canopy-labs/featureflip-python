@@ -186,6 +186,35 @@ class TestConditionEvaluation:
         )
         assert evaluator.evaluate_condition(condition, context) is False
 
+    @pytest.mark.parametrize("negate", [False, True])
+    def test_unrecognised_operator_fails_closed(
+        self, evaluator: FlagEvaluator, context: EvaluationContext, negate: bool
+    ) -> None:
+        """An unrecognised operator must not match, negated or not (#2262).
+
+        An operator this SDK cannot evaluate means "I cannot evaluate this", NOT
+        "this did not match". ``not None`` is True in Python, so inverting it with
+        negate would turn the inability into a match-everyone and serve the flag
+        to 100% of traffic.
+
+        Contrast ``test_missing_attribute_with_negate_returns_true`` above, which
+        legitimately returns negate: absence is a determinate fact about the user,
+        whereas an unrecognised operator is not a fact about the user at all.
+
+        Every ConditionOperator member is covered by the evaluator and _http.py
+        rejects an unknown operator at deserialization, so an out-of-band value is
+        the only way to construct one — but the invariant is what keeps this SDK
+        aligned with the string-typed SDKs (js/go/ruby/php), where an unrecognised
+        operator IS reachable over the wire.
+        """
+        condition = Condition(
+            attribute="country",
+            operator="SomeFutureOperator",  # type: ignore[arg-type]
+            values=["US"],
+            negate=negate,
+        )
+        assert evaluator.evaluate_condition(condition, context) is False
+
     def test_greater_than(
         self, evaluator: FlagEvaluator, context: EvaluationContext
     ) -> None:

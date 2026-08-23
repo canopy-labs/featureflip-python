@@ -90,7 +90,7 @@ print(detail.rule_id)  # Rule ID if reason is RULE_MATCH
 # Track custom events
 client.track("checkout-completed", {"user_id": "123"}, metadata={"total": 99.99})
 
-# Identify users for segment building
+# Record an identify event for analytics (does not affect flag evaluation)
 client.identify({"user_id": "123", "email": "user@example.com", "plan": "pro"})
 
 # Force flush pending events

@@ -312,6 +312,55 @@ class TestTrack:
 class TestIdentify:
     """Tests for identify() method."""
 
+    def _mock_client(self) -> FeatureflipClient:
+        client = FeatureflipClient(
+            sdk_key="test-key",
+            config=Config(streaming=False, send_events=False),
+        )
+        client._core._event_processor = MagicMock()
+        return client
+
+    def test_identify_omits_metadata_when_only_the_identity_was_supplied(self) -> None:
+        """An attribute-less identify() sends no metadata key at all.
+
+        Every server SDK omits the bag rather than sending an empty object, so
+        the wire bytes match across the fleet (#2359).
+        """
+        with patch("featureflip._core.HttpClient") as mock_http:
+            mock_http.return_value.get_flags.return_value = ([], [])
+            client = self._mock_client()
+
+            client.identify({"user_id": "123"})
+
+            event = client._core._event_processor.queue_event.call_args[0][0]
+            assert "metadata" not in event
+            client.close()
+
+    def test_track_omits_metadata_when_none_was_supplied(self) -> None:
+        """track() with no metadata sends no metadata key."""
+        with patch("featureflip._core.HttpClient") as mock_http:
+            mock_http.return_value.get_flags.return_value = ([], [])
+            client = self._mock_client()
+
+            client.track("purchase", {"user_id": "123"})
+
+            event = client._core._event_processor.queue_event.call_args[0][0]
+            assert "metadata" not in event
+            client.close()
+
+    def test_omits_user_id_when_the_context_carries_no_identity(self) -> None:
+        """An anonymous context omits userId rather than sending null."""
+        with patch("featureflip._core.HttpClient") as mock_http:
+            mock_http.return_value.get_flags.return_value = ([], [])
+            client = self._mock_client()
+
+            client.identify({"plan": "pro"})
+
+            event = client._core._event_processor.queue_event.call_args[0][0]
+            assert "userId" not in event
+            assert event["metadata"] == {"plan": "pro"}
+            client.close()
+
     def test_queues_identify_event(self) -> None:
         """identify() queues an identify event."""
         with patch("featureflip._core.HttpClient") as mock_http:

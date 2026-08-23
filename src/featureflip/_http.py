@@ -163,7 +163,7 @@ class HttpClient:
         return FlagConfiguration(
             key=data["key"],
             version=data["version"],
-            type=FlagType(data["type"].lower()),
+            type=self._parse_flag_type(data["type"]),
             enabled=data["enabled"],
             variations=[
                 Variation(key=v["key"], value=v["value"])
@@ -228,12 +228,86 @@ class HttpClient:
         """
         return Condition(
             attribute=data["attribute"],
-            # The wire sends PascalCase operators (e.g. "SemverGreaterThanOrEqual");
-            # ConditionOperator._missing_ normalizes them to the snake_case members.
-            operator=ConditionOperator(data["operator"]),
+            operator=self._parse_operator(data["operator"]),
             values=data["values"],
             negate=data.get("negate", False),
         )
+
+    @staticmethod
+    def _parse_flag_type(raw: Any) -> FlagType | str:
+        """Resolve a wire flag type, tolerating one this SDK version does not know.
+
+        ``FlagType(raw)`` raises ``ValueError`` on an unrecognised name, and because the
+        throw surfaced mid-payload it failed the ENTIRE flags parse: the day a new flag
+        type ships server-side, every pinned SDK stops serving EVERY flag, not just the
+        one carrying the new type (#2395). That is the same total-outage shape #2372
+        fixed for ``ConditionOperator``, triggered by an ordinary additive server change.
+
+        Tolerating it is unconditionally safe here in a way it is NOT for ``ServeType``
+        or ``ConditionLogic``: nothing evaluates this field. It is parsed, stored and
+        re-exported, and no evaluator reads it — go, ruby and php do not even model it.
+        So there is no downstream consumer that could mis-serve on the raw string, and
+        equally none that could warn about it, which is why the diagnostic is emitted
+        here rather than left to evaluation time.
+
+        A non-string type is a DIFFERENT axis and is not tolerated, exactly as in
+        ``_parse_operator``: an integer is the server and SDK disagreeing about the wire
+        format (#2279), and coercing it with ``str()`` would turn ``0`` into the flag
+        type ``"0"`` -- indistinguishable from a genuine unknown name, and silently wrong
+        in the way #2315 exists to prevent.
+        """
+        if not isinstance(raw, str):
+            raise TypeError(
+                f"flag.type must be a string, got {type(raw).__name__}: {raw!r}"
+            )
+
+        try:
+            return FlagType(raw.lower())
+        except ValueError:
+            logger.warning(
+                "Unrecognised flag type - retaining the raw value. This SDK version "
+                "may be older than the flag configuration.",
+                flag_type=raw,
+            )
+            return raw
+
+    @staticmethod
+    def _parse_operator(raw: Any) -> ConditionOperator | str:
+        """Resolve a wire operator, tolerating one this SDK version does not know.
+
+        The wire sends PascalCase operators (e.g. ``"SemverGreaterThanOrEqual"``);
+        ``ConditionOperator._missing_`` normalizes them to the snake_case members.
+
+        An unrecognised name raises ``ValueError`` from the enum call. That used to
+        propagate out of the whole flags-payload parse, so ONE unknown operator in ONE
+        condition of ONE flag failed the ENTIRE fetch and every flag fell back to the
+        caller's defaults (#2372). The trigger is ordinary: a new operator shipped
+        server-side reaching an SDK a customer has pinned.
+
+        The raw string is returned instead of a member, which is safe because
+        ``FlagEvaluator`` fails an unrecognised operator CLOSED (#2262) — its ``case _``
+        arm returns None and ``negate`` never inverts it into a match-everyone. Keeping
+        the original text (rather than substituting a sentinel) means the evaluator's
+        ``unknown_operator`` warning names the operator actually received, which is the
+        one detail an operator debugging this needs.
+
+        A non-string operator is a DIFFERENT axis and is not tolerated. Tolerance here
+        is for an unknown *name*; an integer is the server and SDK disagreeing about the
+        wire format, and coercing it with ``str()`` would turn ``0`` into the operator
+        ``"0"`` -- indistinguishable from a genuine unknown name, and silently wrong in
+        exactly the way #2315 exists to prevent. csharp's tolerant converter had the
+        identical hole (it resolved numbers by ordinal) and closed it the same way; the
+        shared ``malformedConfigVectors`` runner pins both.
+        """
+        if not isinstance(raw, str):
+            raise TypeError(
+                f"condition.operator must be a string, got {type(raw).__name__}: {raw!r}"
+            )
+
+        try:
+            return ConditionOperator(raw)
+        except ValueError:
+            return str(raw)
 
     def _parse_serve(self, data: dict[str, Any]) -> ServeConfig:
         """Parse a serve config from JSON.

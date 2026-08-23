@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.4.3 — 2026-08-23
+
+### Fixed
+
+- An unrecognised `FlagType` no longer fails the entire config fetch. One unknown value in one flag discarded the whole payload, so a single new server-side type could blank out every flag the SDK served. ([#2401](https://github.com/canopy-labs/featureflip/issues/2401))
+- An unrecognised condition operator now fails closed instead of matching every user. The default arm returned `false`, which a negated condition then inverted to `true` — so a config naming an operator the SDK did not know could silently target everyone. ([#2262](https://github.com/canopy-labs/featureflip/issues/2262))
+- An unrecognised condition operator is tolerated at deserialization instead of discarding the whole config, matching the string-typed SDKs. ([#2372](https://github.com/canopy-labs/featureflip/issues/2372))
+- `identify()` and `track()` put the same payload on the wire as every other server SDK. The field set and shapes had drifted per language, so the same call produced different events depending on which SDK sent it. ([#2359](https://github.com/canopy-labs/featureflip/issues/2359))
+
 ## 2.4.2 — 2026-08-05
 
 ### Fixed

@@ -277,3 +277,75 @@ def test_flag_vectors() -> None:
             f"[{v['id']}] reason={_normalize_reason(result)!r}, "
             f"expected {exp['reason']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# coreContractVectors — the shared CORE's contract, one layer above the evaluator
+# ---------------------------------------------------------------------------
+#
+# The four classes above assert what the evaluator computes, with the .NET engine
+# as their oracle. This class asserts the shared core's client-facing contract,
+# where the engine has no opinion and in fact disagrees: it returns null where an
+# SDK must return the CALLER'S default. That is why #1989 and #2281 could not be
+# locked with the existing classes, and why both shipped as 6-of-7-SDK
+# divergences that no CI could see. These vectors are hand-authored, not
+# engine-generated.
+#
+# The Python SDK exposes only a generic ``variation()`` — it has no typed
+# accessors — so it cannot express the ``typeMismatch`` kind at all and skips it.
+# The skip is explicit and asserted below, so a capability gap cannot quietly
+# masquerade as a pass.
+
+_CANONICAL_REASONS = {
+    "Error": EvaluationReason.ERROR,
+    "Fallthrough": EvaluationReason.FALLTHROUGH,
+    "FlagNotFound": EvaluationReason.FLAG_NOT_FOUND,
+}
+
+_PYTHON_SUPPORTED_KINDS = {"match", "malformed", "notFound"}
+
+
+def _contract_core(flags: list[dict[str, Any]]) -> Any:
+    from featureflip._core import _SharedFeatureflipCore
+    from featureflip.config import Config
+
+    parsed = [_parse_flag(f) for f in flags]
+    return _SharedFeatureflipCore(
+        sdk_key=None,
+        config=Config(),
+        test_mode_flags={f.key: f for f in parsed},
+    )
+
+
+def test_core_contract_vectors() -> None:
+    vectors = VECTORS["coreContractVectors"]
+    assert vectors, "no coreContractVectors in fixture"
+
+    executed = 0
+    skipped_type_mismatch = 0
+
+    for v in vectors:
+        if v["kind"] not in _PYTHON_SUPPORTED_KINDS:
+            skipped_type_mismatch += 1
+            continue
+
+        core = _contract_core(v["flags"])
+        detail = core.evaluate(
+            v["flagKey"], {"user_id": v["context"]["userId"]}, v["read"]["default"]
+        )
+
+        assert detail.value == v["expect"]["value"], (
+            f"[{v['id']}] {v['description']}: value={detail.value!r}, "
+            f"expected {v['expect']['value']!r}"
+        )
+        assert detail.reason == _CANONICAL_REASONS[v["expect"]["reason"]], (
+            f"[{v['id']}] {v['description']}: reason={detail.reason!r}, "
+            f"expected {v['expect']['reason']!r}"
+        )
+        executed += 1
+
+    # A runner that silently skips everything is worse than no runner at all.
+    assert executed >= 6, f"only {executed} contract vectors executed"
+    assert skipped_type_mismatch == sum(
+        1 for v in vectors if v["kind"] == "typeMismatch"
+    ), "skip accounting drifted — every skipped vector must be a typeMismatch"

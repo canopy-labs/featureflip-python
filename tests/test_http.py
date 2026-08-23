@@ -6,7 +6,7 @@ from httpx import Response
 
 from featureflip._http import HttpClient
 from featureflip.config import Config
-from featureflip.models import ConditionOperator
+from featureflip.models import ConditionOperator, FlagType
 
 
 class TestHttpClient:
@@ -372,3 +372,162 @@ class TestHttpClient:
         assert len(flag.rules) == 1
         assert flag.rules[0].segment_key == "beta-users"
         assert route.called
+
+class TestUnknownOperatorTolerance:
+    """An operator this SDK version does not know must degrade ONE condition (#2372).
+
+    ``ConditionOperator(raw)`` raises ``ValueError`` on an unrecognised name, and that
+    used to propagate out of the whole flags-payload parse — so one unknown operator in
+    one condition of one flag failed the ENTIRE fetch and every flag fell back to the
+    caller's defaults. The trigger is ordinary: a new operator shipped server-side
+    reaching an SDK a customer has pinned.
+
+    The companion rule is in ``test_evaluation.py``: an unrecognised operator fails
+    CLOSED, so tolerating it here cannot become a match-everyone.
+    """
+
+    @staticmethod
+    def _flag(key: str, operator: str) -> dict:
+        return {
+            "key": key,
+            "version": 1,
+            "type": "Boolean",
+            "enabled": True,
+            "variations": [
+                {"key": "on", "value": True},
+                {"key": "off", "value": False},
+            ],
+            "rules": [
+                {
+                    "id": "r1",
+                    "priority": 0,
+                    "conditionGroups": [
+                        {
+                            "operator": "And",
+                            "conditions": [
+                                {
+                                    "attribute": "country",
+                                    "operator": operator,
+                                    "values": ["US"],
+                                    "negate": True,
+                                }
+                            ],
+                        }
+                    ],
+                    "serve": {"type": "Fixed", "variation": "on"},
+                }
+            ],
+            "fallthrough": {"type": "Fixed", "variation": "off"},
+            "offVariation": "off",
+        }
+
+    def _parse(self, payload: dict) -> list:
+        client = HttpClient(sdk_key="test-key", config=Config(base_url="https://api.example.com"))
+        flags, _segments = client.parse_flags_response(payload)
+        return flags
+
+    def test_unknown_operator_is_retained_as_raw_string(self) -> None:
+        flags = self._parse({"flags": [self._flag("f", "SomeFutureOperator")], "segments": []})
+
+        condition = flags[0].rules[0].condition_groups[0].conditions[0]
+        assert condition.operator == "SomeFutureOperator"
+
+    def test_known_operators_still_parse_to_members(self) -> None:
+        flags = self._parse({"flags": [self._flag("f", "SemverGreaterThanOrEqual")], "segments": []})
+
+        condition = flags[0].rules[0].condition_groups[0].conditions[0]
+        assert condition.operator is ConditionOperator.SEMVER_GREATER_THAN_OR_EQUAL
+
+    def test_one_unknown_operator_does_not_fail_the_whole_response(self) -> None:
+        """The point of the issue: one bad flag must not take its neighbours down."""
+        flags = self._parse(
+            {
+                "flags": [
+                    self._flag("broken", "SomeFutureOperator"),
+                    self._flag("healthy", "Equals"),
+                ],
+                "segments": [],
+            }
+        )
+
+        assert len(flags) == 2
+        healthy = next(f for f in flags if f.key == "healthy")
+        assert (
+            healthy.rules[0].condition_groups[0].conditions[0].operator
+            is ConditionOperator.EQUALS
+        )
+
+
+class TestUnknownFlagTypeTolerance:
+    """A flag type this SDK version does not know must not fail the fetch (#2395).
+
+    ``FlagType(raw)`` raised ``ValueError`` on an unrecognised name, and because the
+    throw surfaced mid-payload it failed the ENTIRE flags parse — so the day a new flag
+    type ships server-side, every pinned SDK stops serving EVERY flag, not just the one
+    carrying the new type.
+
+    Tolerating it is unconditionally safe here in a way it is not for ``ServeType`` or
+    ``ConditionLogic``: nothing evaluates ``FlagConfiguration.type``. It is parsed,
+    stored, re-exported — and never read. ``go``, ``ruby`` and ``php`` do not model the
+    field at all.
+    """
+
+    @staticmethod
+    def _flag(key: str, flag_type: object) -> dict:
+        return {
+            "key": key,
+            "version": 1,
+            "type": flag_type,
+            "enabled": True,
+            "variations": [
+                {"key": "on", "value": True},
+                {"key": "off", "value": False},
+            ],
+            "rules": [],
+            "fallthrough": {"type": "Fixed", "variation": "off"},
+            "offVariation": "off",
+        }
+
+    def _parse(self, payload: dict) -> list:
+        client = HttpClient(sdk_key="test-key", config=Config(base_url="https://api.example.com"))
+        flags, _segments = client.parse_flags_response(payload)
+        return flags
+
+    def test_unknown_flag_type_is_retained_as_raw_string(self) -> None:
+        flags = self._parse({"flags": [self._flag("f", "Timestamp")], "segments": []})
+
+        assert flags[0].type == "Timestamp"
+
+    def test_known_flag_types_still_parse_to_members(self) -> None:
+        flags = self._parse({"flags": [self._flag("f", "Boolean")], "segments": []})
+
+        assert flags[0].type is FlagType.BOOLEAN
+
+    def test_lowercase_wire_spelling_still_parses(self) -> None:
+        """The wire sends PascalCase, but the parse has always lowercased first."""
+        flags = self._parse({"flags": [self._flag("f", "json")], "segments": []})
+
+        assert flags[0].type is FlagType.JSON
+
+    def test_one_unknown_flag_type_does_not_fail_the_whole_response(self) -> None:
+        """The point of the issue: one new-typed flag must not take its neighbours down."""
+        flags = self._parse(
+            {
+                "flags": [
+                    self._flag("future", "Timestamp"),
+                    self._flag("healthy", "Boolean"),
+                ],
+                "segments": [],
+            }
+        )
+
+        assert len(flags) == 2
+        healthy = next(f for f in flags if f.key == "healthy")
+        assert healthy.type is FlagType.BOOLEAN
+
+    def test_non_string_flag_type_is_still_rejected(self) -> None:
+        """The OTHER axis. An integer is the #2279 shape — server and SDK disagreeing
+        about the wire format — and stays a wholesale rejection (#2315). Coercing it
+        would make ``0`` indistinguishable from a genuine unknown type name."""
+        with pytest.raises(TypeError):
+            self._parse({"flags": [self._flag("f", 0)], "segments": []})

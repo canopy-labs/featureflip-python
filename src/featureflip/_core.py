@@ -39,6 +39,20 @@ logger = structlog.get_logger()
 T = TypeVar("T")
 
 
+def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Drop the optional wire fields when they carry nothing.
+
+    ``userId`` and ``metadata`` are both optional on the backend DTO. Every
+    server SDK omits them rather than sending ``null`` or an empty object, so
+    the same call produces the same bytes whichever SDK made it (#2359).
+    """
+    if event.get("userId") is None:
+        event.pop("userId", None)
+    if not event.get("metadata"):
+        event.pop("metadata", None)
+    return event
+
+
 def _resolve_user_id(context: dict[str, Any]) -> str | None:
     """Resolve the built-in user id from a raw context dict.
 
@@ -493,17 +507,23 @@ class _SharedFeatureflipCore:
         # Send the backend SdkEventDto shape: top-level userId, no `context`.
         # See apps/evaluation-api Controllers/SdkController.RecordEvents — the
         # backend has no context/value/reason field, so anything else is dropped.
-        event = {
-            "type": "Custom",
-            "flagKey": event_name,
-            "userId": _resolve_user_id(context or {}),
-            "metadata": metadata or {},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        event = _compact_event(
+            {
+                "type": "Custom",
+                "flagKey": event_name,
+                "userId": _resolve_user_id(context or {}),
+                "metadata": metadata,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         self._event_processor.queue_event(event)
 
     def identify(self, context: dict[str, Any]) -> None:
-        """Send user attributes for segment building."""
+        """Record an identify event for analytics.
+
+        Does not affect flag evaluation: targeting rules and segments are matched
+        against the context passed to each variation call.
+        """
         if self._test_mode_values is not None or self._event_processor is None:
             return
         # Promote the user id to the top-level userId field and put the remaining
@@ -514,13 +534,15 @@ class _SharedFeatureflipCore:
             for k, v in (context or {}).items()
             if k not in ("user_id", "userId")
         }
-        event = {
-            "type": "Identify",
-            "flagKey": "$identify",
-            "userId": _resolve_user_id(context or {}),
-            "metadata": attributes,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        event = _compact_event(
+            {
+                "type": "Identify",
+                "flagKey": "$identify",
+                "userId": _resolve_user_id(context or {}),
+                "metadata": attributes,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         self._event_processor.queue_event(event)
 
     def flush(self) -> None:
@@ -543,13 +565,15 @@ class _SharedFeatureflipCore:
         """
         if self._event_processor is None:
             return
-        event: dict[str, Any] = {
-            "type": "Evaluation",
-            "flagKey": key,
-            "userId": _resolve_user_id(context or {}),
-            "variation": variation_key,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        event: dict[str, Any] = _compact_event(
+            {
+                "type": "Evaluation",
+                "flagKey": key,
+                "userId": _resolve_user_id(context or {}),
+                "variation": variation_key,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         self._event_processor.queue_event(event)
 
     # --- Shutdown ---
