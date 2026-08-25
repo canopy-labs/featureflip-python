@@ -76,6 +76,65 @@ def _parse_numeric(value: str) -> float | None:
         return None
 
 
+# The ONLY characters trimmed from a date operand, and the whole of the operand's
+# permitted whitespace: U+0009..U+000D plus U+0020 -- exactly the class the engine's
+# ``NumberStyles.Integer`` accepts via ``AllowLeadingWhite | AllowTrailingWhite``.
+#
+# ``str.strip()`` is deliberately NOT used: it strips every Unicode whitespace
+# character plus ``\x1c``-``\x1f`` and ``\x85``, so an operand prefixed with any of
+# those was trimmed to ``"5"`` and matched here while the engine rejected it (#2468).
+_OPERAND_WHITESPACE = "\t\n\v\f\r "
+
+# Characters no date operand may contain: a NUL or other control character, or a
+# non-ASCII whitespace/format character. An interior ASCII space is allowed -- it is
+# the ISO-8601 date/time separator.
+_FORBIDDEN_OPERAND_CHAR = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"
+)
+
+# The ISO-8601 grammar a date operand may use: a calendar date, optionally followed by
+# a time (seconds and fractional seconds optional) and an optional offset in either
+# extended (``+05:00`` / ``Z``) or basic (``+0500``) form. The separator may be ``T``
+# or a space -- the engine accepts both. ``[0-9]`` not ``\d``, which is Unicode-aware.
+_ISO_OPERAND = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2}))?(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})?)?$"
+)
+
+
+def _canonicalize_iso(s: str) -> str | None:
+    """Rewrite an accepted ISO operand into the one shape every supported Python parses.
+
+    Returns ``None`` when ``s`` is not an accepted ISO shape. See ``_parse_datetime``
+    for why the grammar is pinned here rather than delegated to ``fromisoformat``.
+    """
+    m = _ISO_OPERAND.match(s)
+    if m is None:
+        return None
+    date, hh, mm, ss, frac, off = m.groups()
+    if hh is None:
+        return date
+    # The engine's DateTimeOffset.TryParse rejects hour 24 outright rather than
+    # rolling it over to 00:00 the next day.
+    if hh >= "24":
+        return None
+    if ss is None:
+        ss = "00"
+    # fromisoformat accepts at most 6 fractional digits on every supported version;
+    # the engine keeps 7 (100ns ticks) and truncates beyond that, so truncating to 6
+    # is the closest representable value rather than a rejection.
+    frac = frac[:7] if frac else ""
+    if off is None:
+        off = ""
+    elif off == "Z":
+        # fromisoformat only accepts a trailing "Z" on 3.11+; spell the offset out.
+        off = "+00:00"
+    elif len(off) == 5:
+        # Basic offset (+0500) -> extended (+05:00), which 3.10 requires.
+        off = off[:3] + ":" + off[3:]
+    return f"{date}T{hh}:{mm}:{ss}{frac}{off}"
+
+
 class FlagEvaluator:
     """Evaluates feature flags against context."""
 
@@ -281,11 +340,12 @@ class FlagEvaluator:
 
         Mirrors the server engine's ``TryParseDateTime``:
 
-        1. Parse as an ISO-8601 date-time. If the string carries a timezone
-           offset (``+05:00`` or ``Z``) it is honoured; if it has no offset the
-           value is assumed to be UTC. The result is normalised to UTC.
-        2. If ISO parsing fails and the string is a bare integer, treat it as
-           Unix time in **seconds**. Out-of-range values fail.
+        1. A bare integer is Unix time in **seconds**, resolved BEFORE any date
+           parse. Out-of-range values fail.
+        2. Otherwise parse as an ISO-8601 date-time in *extended* format. If the
+           string carries a timezone offset (``+05:00`` or ``Z``) it is honoured;
+           if it has no offset the value is assumed to be UTC. The result is
+           normalised to UTC.
         3. Otherwise return ``None`` (no match) — never a lexical fallback.
 
         Note: ``Before``/``After`` are in ``_CASE_SENSITIVE_OPERATORS``, so
@@ -300,23 +360,69 @@ class FlagEvaluator:
         Returns:
             A timezone-aware UTC ``datetime``, or ``None`` if unparseable.
         """
-        raw = s.strip()
+        raw = s.strip(_OPERAND_WHITESPACE)
+        if not raw or _FORBIDDEN_OPERAND_CHAR.search(raw):
+            return None
 
-        # datetime.fromisoformat only accepts a trailing "Z" on Python 3.11+;
-        # rewrite it to an explicit offset so 3.10 parses it too.
-        iso = raw
-        if iso.endswith("Z"):
-            iso = iso[:-1] + "+00:00"
+        # A bare integer is Unix time in SECONDS, and is resolved BEFORE any date
+        # parse. The order is load-bearing (#2466).
+        #
+        # The engine reads as `TryParse` first, unix second, and this used to
+        # mirror that literally -- but the two halves are not equivalent, because
+        # `DateTimeOffset.TryParse` REJECTS every pure-numeric string while
+        # `fromisoformat` accepts an 8-digit one as an ISO *basic* date from
+        # Python 3.11 on. So the engine always reached its unix fallback and this
+        # SDK stopped reaching it at 3.11: `"20240101"` became 2024-01-01 here and
+        # 1970-08-23T06:15:01Z everywhere else. Because the SDK supports 3.10-3.13,
+        # that also made the same flag config evaluate differently depending on the
+        # customer's interpreter.
+        #
+        # Checking the integer first is what makes the two agree, since no string
+        # that is entirely digits is a date to the engine. This is the same
+        # reasoning #2433 applied to js, and js/go/php order the guard this way.
+        #
+        # The sign class matches the engine's `long.TryParse` with
+        # `NumberStyles.Integer`, which is `AllowLeadingWhite |
+        # AllowTrailingWhite | AllowLeadingSign` -- so a leading "+" is
+        # accepted deliberately, not incidentally, and `int()` reads it the
+        # same way. Omitting it here made `"+5"` an unparseable string that
+        # matched NOTHING, while the engine and four other SDKs read it as
+        # five seconds past the epoch (#2458).
+        #
+        # The digit class is `[0-9]` and NOT `\d`, which in Python is
+        # Unicode-aware: `\d` matches every character in category Nd, and
+        # `int()` accepts them, so `"١٢٣"` (Arabic-Indic) parsed as 123 here
+        # while the engine -- and ruby, php, js and go -- rejected it
+        # outright. Widening the sign class would otherwise have grown that
+        # divergence to cover the `+`-prefixed forms too.
+        if re.fullmatch(r"[+-]?[0-9]+", raw):
+            try:
+                return datetime.fromtimestamp(int(raw), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+
+        # The ISO branch parses a CANONICALIZED string, never the raw operand.
+        #
+        # `fromisoformat`'s accepted grammar WIDENS between interpreter versions --
+        # 3.11 taught it ISO basic and week dates, and it still rejects a nanosecond
+        # fraction and a basic `+0500` offset on 3.10 while accepting both later. So
+        # the same operand evaluated differently depending on the customer's
+        # interpreter, in BOTH directions: over-accepting `"20240101"` from 3.11 on
+        # (#2466), and under-accepting `"2024-01-01T00:00:00.123456789Z"` and
+        # `"2024-01-01T00:00:00+0500"` before it (#2468).
+        #
+        # `_canonicalize_iso` pins the accepted grammar here instead of delegating it,
+        # and hands `fromisoformat` only the one shape every supported version parses
+        # identically: extended date, `T` separator, seconds present, at most six
+        # fractional digits, offset as `+HH:MM`. What the interpreter does with the
+        # other shapes stops mattering.
+        canonical = _canonicalize_iso(raw)
+        if canonical is None:
+            return None
 
         try:
-            dt = datetime.fromisoformat(iso)
+            dt = datetime.fromisoformat(canonical)
         except ValueError:
-            # Unix timestamp fallback (seconds since epoch).
-            if re.fullmatch(r"-?\d+", raw):
-                try:
-                    return datetime.fromtimestamp(int(raw), tz=timezone.utc)
-                except (OverflowError, OSError, ValueError):
-                    return None
             return None
 
         # Naive datetimes are assumed UTC; aware ones are converted to UTC.

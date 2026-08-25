@@ -80,5 +80,23 @@ def test_malformed_config_vector(vector):
         assert (
             "mc-accepted-flag" in store["flags"] or "mc-accepted" in store["segments"]
         ), f"{label}: accepted payload did not apply"
+    elif vector["expect"] == "dropEntity":
+        # Neither accept nor reject: the payload APPLIES, minus the entities carrying an
+        # enum this build cannot evaluate. Both halves are asserted — "dropped" alone is
+        # satisfied by rejecting the whole payload, and "kept" alone by tolerating the
+        # bad value.
+        #
+        # `applied` must be True: UnevaluableEntityError is deliberately outside the
+        # _REJECTION family, so a build that raised it out of parse_flags_response
+        # instead of dropping the entity fails here rather than passing quietly.
+        assert applied, f"{label}: payload was rejected wholesale"
+        for key in vector.get("dropFlags", []):
+            assert key not in store["flags"], f"{label}: flag {key} should have been dropped"
+        for key in vector.get("dropSegments", []):
+            assert key not in store["segments"], f"{label}: segment {key} should have been dropped"
+        for key in vector.get("keepFlags", []):
+            assert key in store["flags"], f"{label}: flag {key} should have been kept"
+        for key in vector.get("keepSegments", []):
+            assert key in store["segments"], f"{label}: segment {key} should have been kept"
     else:
         raise AssertionError(f"unmapped expect {vector['expect']!r}")

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 import structlog
 
 from featureflip._version import USER_AGENT
+from featureflip.exceptions import UnevaluableEntityError
 from featureflip.models import (
     Condition,
     ConditionGroup,
@@ -25,9 +26,14 @@ from featureflip.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from featureflip.config import Config
 
 logger = structlog.get_logger()
+
+_T = TypeVar("_T")
+_E = TypeVar("_E", ServeType, ConditionLogic)
 
 
 class HttpClient:
@@ -94,9 +100,41 @@ class HttpClient:
         Reused for the connect-time ``sync`` SSE snapshot, which carries the
         identical payload shape inline (no extra HTTP round-trip).
         """
-        flags = [self._parse_flag(f) for f in data.get("flags", [])]
-        segments = [self._parse_segment(s) for s in data.get("segments", [])]
+        flags = self._drop_unevaluable(data.get("flags", []), self._parse_flag, "flag")
+        segments = self._drop_unevaluable(
+            data.get("segments", []), self._parse_segment, "segment"
+        )
         return flags, segments
+
+    @staticmethod
+    def _drop_unevaluable(
+        entries: list[dict[str, Any]],
+        parse: Callable[[dict[str, Any]], _T],
+        kind: str,
+    ) -> list[_T]:
+        """Parse each entry, dropping the ones this build cannot evaluate (#2402).
+
+        Scoped to ``UnevaluableEntityError`` alone. Every other parse failure still
+        propagates and fails the payload wholesale, because those are wire-contract
+        violations (#2315) where a partially-applied snapshot silently mis-evaluates
+        every flag it touches. This one is not a violation at all: the payload is
+        well-formed and simply describes behaviour a newer server understands and this
+        build does not, so the blast radius is the one entity that carried it.
+        """
+        parsed: list[_T] = []
+        for entry in entries:
+            try:
+                parsed.append(parse(entry))
+            except UnevaluableEntityError as e:
+                logger.warning(
+                    "Dropping an entity this SDK version cannot evaluate - the rest of "
+                    "the configuration was applied. This SDK version may be older than "
+                    "the flag configuration.",
+                    kind=kind,
+                    key=entry.get("key"),
+                    reason=str(e),
+                )
+        return parsed
 
     def get_flag(self, key: str) -> FlagConfiguration:
         """Fetch a single flag configuration by key.
@@ -148,7 +186,9 @@ class HttpClient:
             conditions=[
                 self._parse_condition(c) for c in data.get("conditions", [])
             ],
-            condition_logic=ConditionLogic(data.get("conditionLogic", "and").lower()),
+            condition_logic=self._parse_condition_logic(
+                data.get("conditionLogic", "and"), "conditionLogic"
+            ),
         )
 
     def _parse_flag(self, data: dict[str, Any]) -> FlagConfiguration:
@@ -211,7 +251,9 @@ class HttpClient:
             Parsed ConditionGroup object.
         """
         return ConditionGroup(
-            operator=ConditionLogic(data.get("operator", "And").lower()),
+            operator=self._parse_condition_logic(
+                data.get("operator", "And"), "conditionGroup.operator"
+            ),
             conditions=[
                 self._parse_condition(c) for c in data.get("conditions", [])
             ],
@@ -232,6 +274,47 @@ class HttpClient:
             values=data["values"],
             negate=data.get("negate", False),
         )
+
+    @staticmethod
+    def _parse_serve_type(raw: Any) -> ServeType:
+        """Resolve a wire serve type, dropping the containing entity on an unknown name.
+
+        Unlike ``_parse_flag_type`` (#2401) this value cannot be tolerated and stored:
+        ``FlagEvaluator`` dispatches ``serve.type is ServeType.FIXED`` else ROLLOUT, so a
+        raw string would take the rollout arm and bucket against weights that may not
+        exist. See :class:`UnevaluableEntityError`.
+        """
+        return HttpClient._resolve_enum(raw, ServeType, "serve.type", "serve type")
+
+    @staticmethod
+    def _parse_condition_logic(raw: Any, path: str) -> ConditionLogic:
+        """Resolve a wire condition logic, dropping the containing entity on an unknown
+        name. ``evaluate_conditions`` dispatches AND else ANY, so an unrecognised value
+        would make a segment meant to require ALL of its conditions match ANY of them —
+        the rule fails OPEN and over-targets."""
+        return HttpClient._resolve_enum(raw, ConditionLogic, path, "condition logic")
+
+    @staticmethod
+    def _resolve_enum(raw: Any, enum_cls: type[_E], path: str, label: str) -> _E:
+        # `.lower()` on a non-string still raises AttributeError, which is the wire-TYPE
+        # violation axis and still fails the payload wholesale (#2315). Deliberately
+        # untouched: an integer is the server and SDK disagreeing about the wire format,
+        # not a newer server shipping a value this build has not heard of.
+        lowered = raw.lower()
+
+        try:
+            return enum_cls(lowered)
+        except ValueError:
+            # An EMPTY value is the field being absent, which is the
+            # missing-required-field axis rather than this one, and the SDKs
+            # deliberately disagree about it. Re-raise so its handling is unchanged;
+            # only a value that is PRESENT and unrecognised drops the entity, which
+            # keeps this change purely additive.
+            if lowered == "":
+                raise
+            raise UnevaluableEntityError(
+                f'{path} "{raw}" is not a {label} this SDK version understands'
+            ) from None
 
     @staticmethod
     def _parse_flag_type(raw: Any) -> FlagType | str:
@@ -325,7 +408,7 @@ class HttpClient:
                 for v in data["variations"]
             ]
         return ServeConfig(
-            type=ServeType(data["type"].lower()),
+            type=self._parse_serve_type(data["type"]),
             variation=data.get("variation"),
             bucket_by=data.get("bucketBy"),
             salt=data.get("salt"),

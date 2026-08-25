@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.5.1 — 2026-08-24
+
+### Fixed
+
+- A date operand is now trimmed of exactly the whitespace the evaluation engine trims (tab, newline, vertical tab, form feed, carriage return and space), and is rejected outright if it still carries a NUL, another control character, or a non-ASCII whitespace character. Each SDK had been relying on its own language's `trim`, and no two of those cover the same set, so the same operand could match on one SDK and match nothing on another. ([#2468](https://github.com/canopy-labs/featureflip/issues/2468))
+- The ISO-8601 grammar no longer shifts with the interpreter version. `fromisoformat` now only ever sees a canonicalised string, so a nanosecond fraction and a basic `+0500` offset parse identically on 3.10 and 3.13 — previously they were accepted on newer interpreters and rejected on 3.10. ([#2468](https://github.com/canopy-labs/featureflip/issues/2468))
+- An ISO-8601 operand naming hour 24 (`2024-01-01T24:00:00`) matches nothing, rather than rolling over to the next day. ([#2468](https://github.com/canopy-labs/featureflip/issues/2468))
+
+## 2.5.0 — 2026-08-24
+
+### Fixed
+
+- Analytics events survive a transient failure of the events endpoint. The queue was emptied before the POST and the batch discarded on any error, so every 503 the edge returned silently lost a batch. A retryable failure — any 5xx, a 429, or a network error or timeout — now puts the batch back at the front of the queue for the next flush. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+- A permanently rejected batch is still dropped, and now says so. A 400, 401 or 403 fails identically however often it is resent, so the batch is discarded with a warning naming it as non-retryable instead of being retried forever at the expense of every later event. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+- A failing endpoint no longer receives one request per tracked event. A re-queued batch leaves the queue at its flush threshold, so the batch-size trigger would otherwise have fired on every subsequent event; it now backs off for one flush interval after a retryable failure, leaving the periodic flush to do the retrying. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+- `stop()` makes a single final flush attempt rather than retrying, so shutdown cannot hang while the endpoint is down. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+
+### Changed
+
+- A flush sends at most `flush_batch_size` events per request, looping until the queue is empty, rather than posting the whole queue in one body. Now that failed batches are kept, the queue can sit at its bound through an outage, and a body that large invites a 413 — which is not retryable, so the entire backlog would have been dropped by the path meant to preserve it. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+- The event queue is bounded at 10,000 events, overridable with `EventProcessor(max_queue_size=...)`. Past the bound the oldest events are shed and the number dropped is logged, so an extended outage sheds the stalest analytics instead of growing the queue without limit. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+
 ## 2.4.3 — 2026-08-23
 
 ### Fixed
