@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.6.0 — 2026-08-26
+
+### Changed
+
+- A long-lived SSE stream severed mid-frame is now logged at `debug` instead of `warning`. Such a sever is routine behind a CDN or reverse proxy: the client reconnects and the server replays a full `sync` snapshot, so no configuration is missed and nothing is degraded — but reporting it at `warning` turned ordinary operation into a recurring alarm. A stream that never delivers an event is still logged at `warning`, and repeated failures still escalate to the polling fallback, so a genuinely broken stream stays visible. ([#2457](https://github.com/canopy-labs/featureflip/issues/2457))
+
+### Fixed
+
+- A date operand whose fractional second has 1, 2, 4 or 5 digits (`2024-01-31T09:30:00.5Z`) matched **nothing on Python 3.10** while resolving normally on 3.11+, so the same flag config evaluated differently depending on the customer's interpreter. 3.10's `datetime.fromisoformat` reads the fraction as a fixed-width field and accepts exactly 3 or exactly 6 digits; the SDK truncated a long fraction to 6 but never padded a short one. Fractions are now normalized to exactly six digits, the width every supported version accepts, which is value-preserving (`.5` and `.500000` are the same 500ms). Same defect class as the 3.11 ISO-basic divergence fixed in 2.4.2. ([#2480](https://github.com/canopy-labs/featureflip/issues/2480))
+
+- An explicit `client.flush()` no longer opens a second drain loop while one is already running. The in-flight latch added for [#2456](https://github.com/canopy-labs/featureflip/issues/2456) guarded only the batch-size trigger, so the periodic flush, an explicit `client.flush()` and a size-triggered flush could enter the loop together — two request streams against an endpoint the backoff gate exists to protect, and worse, a success in one cleared the gate a failure in the other had just armed, re-opening the one-request-per-evaluation behaviour outright. A caller arriving while a drain is running now waits for it and returns, matching the js and node SDKs. Shutdown still bypasses coalescing, because it is the last drain there will ever be. ([#2477](https://github.com/canopy-labs/featureflip/issues/2477))
+
+- A `Before`/`After` date operand that resolves outside `datetime`'s range no longer raises `OverflowError` out of flag evaluation, and now matches nothing instead. Shifting such an operand to UTC raises `OverflowError` — **not** `ValueError`, the only exception the parser caught — so `0001-01-01T00:00:00+05:00` or `9999-12-31T23:59:59-05:00` in a saved rule propagated an exception into the calling application rather than returning a value. This SDK was the only one where such an operand raised rather than merely diverging. ([#2500](https://github.com/canopy-labs/featureflip/issues/2500))
+
+- The same applies to a context **attribute** carrying such a value, which is the side an application does not control. ([#2500](https://github.com/canopy-labs/featureflip/issues/2500))
+
+- Rejecting these also aligns the SDK with the evaluation engine, whose accepted range is the same (`DateTimeOffset.TryParse` bounds it at 0001-01-01T00:00:00Z to 9999-12-31T23:59:59.999Z). Year 0 was already rejected here; the offset-crossed shapes are what raised. ([#2500](https://github.com/canopy-labs/featureflip/issues/2500))
+
+- The first SSE reconnect after a healthy stream drops is now jittered to `[d/2, d]`, like every other backoff level. The drops this absorbs are fleet-wide — a single edge event severs every stream at once — so every client re-entered the backoff together and waited an identical delay, republishing the drop's own synchronisation as a reconnect spike one backoff later. Measured in production: a drop spread across 2.5–3.0 ms produced a reconnect spread of 26–46 ms. The delay never exceeds the previous one and stays strictly positive, so a stream that fails immediately still cannot busy-loop. ([#2508](https://github.com/canopy-labs/featureflip/issues/2508))
+
 ## 2.5.1 — 2026-08-24
 
 ### Fixed

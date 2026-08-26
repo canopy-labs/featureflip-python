@@ -104,6 +104,21 @@ class EventProcessor:
         self._next_auto_flush_at = 0.0
         # True while a batch-size-triggered flush is in flight. See queue_event.
         self._auto_flush_in_flight = False
+        # Coalescing state for the drain loop. ``_auto_flush_in_flight`` above only
+        # ever guarded the SIZE trigger; nothing stopped the periodic thread, an
+        # explicit client.flush() and a size-triggered flush from entering the loop
+        # together. Two concurrent drains mean two request streams against the
+        # endpoint the backoff gate exists to protect -- and a success in one clears
+        # the gate a failure in the other has just armed, re-opening the
+        # one-request-per-event behaviour outright (#2477).
+        #
+        # A generation counter rather than a flag: a waiter has to be able to tell
+        # "the drain I was waiting for has finished" from "a later drain is running",
+        # or it would sleep through its own completion and wake on someone else's.
+        self._drain_in_flight = False
+        self._drain_started = 0
+        self._drain_finished = 0
+        self._drain_done = threading.Condition(self._lock)
         # True from stop() onward: the queue is closed to re-queues because nothing
         # will flush it again.
         self._stopping = False
@@ -152,7 +167,36 @@ class EventProcessor:
         Blocks until the flush is complete. If the queue is empty, no API call is
         made. Send failures are logged and never raised: a retryable one keeps its
         batch for the next flush, a permanent one drops it.
+
+        At most one drain runs at a time. A caller that arrives while one is
+        already going waits for it and returns -- it does NOT start its own, and it
+        does NOT return early, because a caller that asked for a flush is asking
+        for its events to be sent. This matches the js/node SDKs, whose ``flush()``
+        has always returned the in-flight promise (#2477).
         """
+        with self._lock:
+            if self._drain_in_flight:
+                waiting_for = self._drain_started
+                # Waking on the wrong drain is the failure mode this guards: a
+                # spurious wakeup, or a later drain starting, must not be mistaken
+                # for the one this caller is owed.
+                while self._drain_finished < waiting_for:
+                    self._drain_done.wait()
+                return
+            self._drain_in_flight = True
+            self._drain_started += 1
+            mine = self._drain_started
+
+        try:
+            self._drain()
+        finally:
+            with self._lock:
+                self._drain_in_flight = False
+                self._drain_finished = mine
+                self._drain_done.notify_all()
+
+    def _drain(self) -> None:
+        """The drain loop itself, callable when coalescing must be bypassed."""
         # One request per batch rather than one for the whole queue. Re-queuing
         # failed batches is what lets the queue grow to its bound during an outage,
         # and posting 10,000 events in a single body risks the server rejecting it
@@ -284,7 +328,13 @@ class EventProcessor:
         with self._lock:
             self._stopping = True
 
-        self.flush()
+        # _drain, not flush: shutdown must never be the call that gets coalesced
+        # away. If a periodic drain happens to be in flight, flush() would wait for
+        # it and return, and anything enqueued after that loop's last look at the
+        # queue would be discarded unsent. Two drains overlapping is safe here
+        # precisely because _stopping is already set, so neither can re-queue and
+        # there is no backoff left to disarm.
+        self._drain()
 
         # Anything a concurrent queue_event slipped in during the flush.
         with self._lock:

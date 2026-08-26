@@ -120,10 +120,20 @@ def _canonicalize_iso(s: str) -> str | None:
         return None
     if ss is None:
         ss = "00"
-    # fromisoformat accepts at most 6 fractional digits on every supported version;
-    # the engine keeps 7 (100ns ticks) and truncates beyond that, so truncating to 6
-    # is the closest representable value rather than a rejection.
-    frac = frac[:7] if frac else ""
+    # Normalize the fraction to EXACTLY six digits -- pad as well as truncate.
+    #
+    # Truncating alone was not enough, and the gap was interpreter-dependent in the
+    # #2466 way: 3.10's ``fromisoformat`` reads the fraction as a fixed-width field and
+    # accepts exactly 3 or exactly 6 digits, while 3.11+ accepts 1-6. So ``.5``, ``.12``,
+    # ``.1234`` and ``.12345`` raised ValueError on 3.10 and resolved on 3.11+ -- the same
+    # operand matching nothing or matching, decided by the customer's interpreter. Six is
+    # the width every supported version accepts, and padding is value-preserving
+    # (``.5`` and ``.500000`` are the same 500ms).
+    #
+    # The engine keeps 7 digits (100ns ticks) and truncates beyond that, so truncating to
+    # 6 remains the closest representable value rather than a rejection. Caught by
+    # dg-accepted-fraction-*, which the 3.10 leg of the matrix is the only thing to run.
+    frac = (frac + "000000")[:7] if frac else ""
     if off is None:
         off = ""
     elif off == "Z":
@@ -428,7 +438,24 @@ class FlagEvaluator:
         # Naive datetimes are assumed UTC; aware ones are converted to UTC.
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+
+        # `astimezone` raises OverflowError -- NOT ValueError -- when shifting the
+        # operand to UTC would leave `datetime`'s range, and that is reachable from an
+        # operand the grammar accepts: `0001-01-01T00:00:00+05:00` resolves below
+        # MINYEAR and `9999-12-31T23:59:59-05:00` above MAXYEAR, because the offset
+        # moves the instant while `[0-9]{4}` only constrains the WRITTEN year.
+        #
+        # Uncaught, that escaped `evaluate_condition` as an OverflowError rather than
+        # returning no-match -- the only SDK where such an operand raised instead of
+        # diverging, so a single saved rule took the customer's application down rather
+        # than serving a wrong variation (#2500). The engine returns false for exactly
+        # these operands (`DateTimeOffset.TryParse` is bounded the same way), so
+        # rejecting is also what makes python agree with it rather than merely stop
+        # crashing.
+        try:
+            return dt.astimezone(timezone.utc)
+        except OverflowError:
+            return None
 
     def _compare_datetime(self, value: str, target: str, op: str) -> bool:
         """Compare two values as UTC date-time instants.

@@ -767,3 +767,118 @@ class TestEventProcessorFlushResilience:
         processor.flush()
 
         assert mock_http.post_events.call_count == 3
+
+
+class TestEventProcessorFlushCoalescing:
+    """A flush must never run two drain loops at once (#2477)."""
+
+    @pytest.fixture
+    def mock_http(self) -> MagicMock:
+        return MagicMock()
+
+    def test_concurrent_flush_runs_only_one_drain(self, mock_http: MagicMock) -> None:
+        """A second flush waits for the in-flight drain instead of opening its own.
+
+        Two concurrent drains mean two request streams against the endpoint the
+        backoff gate exists to protect -- and a success in one clears the gate a
+        failure in the other has just armed.
+        """
+        in_flight = 0
+        peak = 0
+        gate = threading.Event()
+        first_arrived = threading.Event()
+        depth_lock = threading.Lock()
+
+        def post_events(_events: list[dict[str, Any]]) -> None:
+            nonlocal in_flight, peak
+            with depth_lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+                held = not first_arrived.is_set()
+            if held:
+                first_arrived.set()
+                gate.wait(timeout=5.0)
+            with depth_lock:
+                in_flight -= 1
+
+        mock_http.post_events.side_effect = post_events
+
+        # Batch size 1 so the queue below needs six round-trips to drain: plenty
+        # of room for a second loop to interleave if one is allowed to start.
+        processor = EventProcessor(
+            http_client=mock_http, flush_interval=3600.0, flush_batch_size=1
+        )
+        # Seeded directly rather than through queue_event: at this batch size
+        # every call would fire the size trigger and start a drain of its own, so
+        # the test would be parked in setup before it had started either flush.
+        processor._queue.extend(
+            {"type": "Evaluation", "flag_key": f"flag-{i}"} for i in range(6)
+        )
+
+        first = threading.Thread(target=processor.flush)
+        first.start()
+        assert first_arrived.wait(timeout=5.0), "the first flush never reached the sender"
+
+        released = threading.Event()
+        second_saw_release: list[bool] = []
+
+        def second_flush() -> None:
+            processor.flush()
+            second_saw_release.append(released.is_set())
+
+        second = threading.Thread(target=second_flush)
+        second.start()
+
+        # Room for the second caller to misbehave: uncoalesced it takes a batch
+        # off the front and posts it, which the peak counter catches.
+        time.sleep(0.1)
+
+        released.set()
+        gate.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+
+        assert peak == 1, f"peak concurrent event requests = {peak}, want 1 -- a second drain loop ran"
+        assert second_saw_release == [True], (
+            "the second flush returned before the in-flight drain finished; "
+            "a caller that asked for a flush must wait for it"
+        )
+        assert processor._queue == []
+
+    def test_stop_drains_even_while_a_flush_is_in_flight(
+        self, mock_http: MagicMock
+    ) -> None:
+        """stop() is the last drain there will ever be, so it must bypass coalescing."""
+        gate = threading.Event()
+        first_arrived = threading.Event()
+        sent: list[int] = []
+        sent_lock = threading.Lock()
+
+        def post_events(events: list[dict[str, Any]]) -> None:
+            held = not first_arrived.is_set()
+            if held:
+                first_arrived.set()
+                gate.wait(timeout=5.0)
+            with sent_lock:
+                sent.append(len(events))
+
+        mock_http.post_events.side_effect = post_events
+
+        processor = EventProcessor(
+            http_client=mock_http, flush_interval=3600.0, flush_batch_size=1
+        )
+        processor._queue.extend(
+            {"type": "Evaluation", "flag_key": f"flag-{i}"} for i in range(2)
+        )
+
+        first = threading.Thread(target=processor.flush)
+        first.start()
+        assert first_arrived.wait(timeout=5.0)
+
+        # Released as stop() runs, so stop() genuinely overlaps the in-flight
+        # drain rather than waiting it out first.
+        threading.Timer(0.05, gate.set).start()
+        processor.stop()
+        first.join(timeout=5.0)
+
+        assert len(sent) == 2, f"sender saw {len(sent)} request(s), want 2 -- stop() lost events to coalescing"

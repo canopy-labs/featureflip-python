@@ -180,18 +180,32 @@ class StreamingHandler:
                         break
                     self._handle_event(event.event, event.data)
         except Exception as e:
-            logger.warning("streaming_error", error=str(e))
+            # A stream severed after it was healthy is routine behind a CDN or proxy
+            # (#2457): _run reconnects and the server replays a full `sync`, so no
+            # configuration is missed and nothing is degraded. A stream that never
+            # delivered an event carried no configuration at all -- that stays a
+            # warning, and _run escalates to the polling fallback if it persists.
+            if reached:
+                logger.debug("streaming_error", error=str(e))
+            else:
+                logger.warning("streaming_error", error=str(e))
             self._on_error(e)
         return reached
 
     def _backoff_delay(self, failures: int) -> float:
-        """Capped exponential backoff.
+        """Capped exponential backoff, jittered at every level.
 
-        Base for the first (re)connect, then doubling up to the cap, with
-        [d/2, d) jitter once escalating (thundering-herd avoidance).
+        [d/2, d) for the first (re)connect, then doubling up to the cap.
+
+        Jittering the FIRST reconnect is load-bearing, not cosmetic: the drops
+        this absorbs are fleet-wide - one edge event severs every stream at once
+        (#2457) - so every client re-enters here at ``failures == 0`` together. A
+        constant there replayed the drop's own synchronisation as a reconnect
+        spike one base delay later (#2508). The jitter band is strictly positive,
+        so a clean EOF still cannot busy-loop.
         """
         if failures <= 1:
-            return self._reconnect_base_delay
+            return self._with_jitter(self._reconnect_base_delay)
         delay = self._reconnect_base_delay
         for _ in range(1, failures):
             delay *= 2

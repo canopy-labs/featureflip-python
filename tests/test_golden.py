@@ -203,9 +203,14 @@ def test_rollout_vectors() -> None:
         )
 
 
-def test_condition_vectors() -> None:
-    """Individual condition operators must evaluate to the expected match result."""
-    for v in VECTORS["conditionVectors"]:
+def _run_condition_vectors(vectors: list) -> None:
+    """Build the single-condition flag each vector describes and assert the match.
+
+    Shared by the engine-generated condition vectors and the hand-authored
+    date-grammar vectors, which have an identical input shape.
+    """
+    assert vectors, "no vectors loaded"
+    for v in vectors:
         flag = _parse_flag({
             "key": "cond",
             "version": 1,
@@ -247,6 +252,27 @@ def test_condition_vectors() -> None:
             f"values={v['values']!r} negate={v.get('negate', False)} "
             f"-> match={got}, expected {v['expectedMatch']}"
         )
+
+
+def test_condition_vectors() -> None:
+    """Individual condition operators must evaluate to the expected match result."""
+    _run_condition_vectors(VECTORS["conditionVectors"])
+
+
+def test_date_grammar_vectors() -> None:
+    """A date operand outside the ISO grammar must match nothing (#2480).
+
+    Hand-authored because the ENGINE DISSENTS: ``DateTimeOffset.TryParse`` under the
+    invariant culture resolves ``05/15/2023``, ``Jan 1 2024`` and ``2024.01.01``, so
+    generating these would assert the opposite of what every SDK must do. The engine
+    keeps that leniency deliberately -- narrowing it would stop an already-saved
+    operand from evaluating -- and Management rejects them on the write path instead.
+
+    The six SDKs that always rejected these did so as a SIDE EFFECT of their grammar
+    and not one of them asserted it, which is how js came to resolve a non-ISO operand
+    in the host's timezone unnoticed.
+    """
+    _run_condition_vectors(VECTORS["dateGrammarVectors"])
 
 
 def test_flag_vectors() -> None:

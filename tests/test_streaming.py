@@ -3,9 +3,14 @@
 import json
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from featureflip._streaming import _SSE_READ_TIMEOUT_SECONDS, StreamingHandler
 from featureflip.config import Config
@@ -330,7 +335,7 @@ class TestStreamingHandler:
 
         handler.stop()
 
-    def test_backoff_delay_uses_base_for_first_failures(
+    def test_sever_after_healthy_stream_logs_debug_not_warning(
         self,
         config: Config,
         on_flag_updated: MagicMock,
@@ -338,15 +343,121 @@ class TestStreamingHandler:
         on_segment_updated: MagicMock,
         on_error: MagicMock,
     ) -> None:
-        """The first (re)connect uses the base delay with no jitter."""
+        """A stream severed after it was healthy is routine, not a warning (#2457).
+
+        Long-lived streams behind a CDN are severed a few times a day. The handler
+        reconnects and the server replays a full `sync`, so nothing is degraded --
+        reporting it at warning turned ordinary operation into recurring alarm.
+        """
+        handler = self._make_handler(
+            config, on_flag_updated, on_flag_deleted, on_segment_updated, on_error
+        )
+
+        class _SeveredSource:
+            """Delivers one frame, then dies mid-stream."""
+
+            def iter_sse(self) -> Iterator[SimpleNamespace]:
+                yield SimpleNamespace(event="ping", data="{}")
+                raise httpx.ReadError("The response ended prematurely")
+
+        @contextmanager
+        def _fake_connect_sse(*_args: object, **_kwargs: object) -> Iterator[_SeveredSource]:
+            yield _SeveredSource()
+
+        with (
+            patch("featureflip._streaming.connect_sse", _fake_connect_sse),
+            capture_logs() as logs,
+        ):
+            reached = handler._connect()
+
+        assert reached is True, "the stream was healthy before it was severed"
+        errors = [e for e in logs if e["event"] == "streaming_error"]
+        assert errors, "the sever should still be recorded"
+        assert all(e["log_level"] == "debug" for e in errors)
+
+        handler.stop()
+
+    def test_stream_that_never_delivers_an_event_logs_warning(
+        self,
+        config: Config,
+        on_flag_updated: MagicMock,
+        on_flag_deleted: MagicMock,
+        on_segment_updated: MagicMock,
+        on_error: MagicMock,
+    ) -> None:
+        """A stream that never becomes healthy IS degraded, and must still warn.
+
+        The counterpart to quieting the routine sever: if no event ever arrives the
+        handler has no configuration, so the severity has to stay loud.
+        """
+        handler = self._make_handler(
+            config, on_flag_updated, on_flag_deleted, on_segment_updated, on_error
+        )
+
+        def _refuse(*_args: object, **_kwargs: object) -> None:
+            raise httpx.ConnectError("connection refused")
+
+        with (
+            patch("featureflip._streaming.connect_sse", _refuse),
+            capture_logs() as logs,
+        ):
+            reached = handler._connect()
+
+        assert reached is False
+        errors = [e for e in logs if e["event"] == "streaming_error"]
+        assert errors, "a stream that never connects should be logged"
+        assert all(e["log_level"] == "warning" for e in errors)
+
+        handler.stop()
+
+    def test_backoff_delay_uses_base_band_for_first_failures(
+        self,
+        config: Config,
+        on_flag_updated: MagicMock,
+        on_flag_deleted: MagicMock,
+        on_segment_updated: MagicMock,
+        on_error: MagicMock,
+    ) -> None:
+        """The first (re)connect waits [base/2, base) — jittered like every level."""
         handler = self._make_handler(
             config, on_flag_updated, on_flag_deleted, on_segment_updated, on_error
         )
         handler._reconnect_base_delay = 3.0
         handler._max_reconnect_delay = 30.0
 
-        assert handler._backoff_delay(0) == 3.0
-        assert handler._backoff_delay(1) == 3.0
+        for failures in (0, 1):
+            delay = handler._backoff_delay(failures)
+            assert 1.5 <= delay < 3.0
+            assert delay > 0  # anti-busy-loop on a clean EOF
+
+    def test_backoff_delay_jitters_first_reconnect_so_fleet_does_not_lockstep(
+        self,
+        config: Config,
+        on_flag_updated: MagicMock,
+        on_flag_deleted: MagicMock,
+        on_segment_updated: MagicMock,
+        on_error: MagicMock,
+    ) -> None:
+        """A fleet-wide drop must not produce a fleet-wide reconnect spike.
+
+        One edge event severs every stream at once (#2457 — a 2.5-3.0ms spread
+        across both eval-api pods), so every client re-enters the backoff at
+        failures == 0 together. A constant there replays the drop's own
+        synchronisation as a reconnect spike one base delay later (#2508).
+        """
+        handler = self._make_handler(
+            config, on_flag_updated, on_flag_deleted, on_segment_updated, on_error
+        )
+        handler._reconnect_base_delay = 3.0
+        handler._max_reconnect_delay = 30.0
+
+        samples = {handler._backoff_delay(f) for _ in range(200) for f in (0, 1)}
+
+        assert len(samples) > 1, (
+            f"first-reconnect delay is deterministic ({len(samples)} distinct "
+            "value(s)) - a fleet-wide drop reconnects in lockstep"
+        )
+        assert all(1.5 <= d < 3.0 for d in samples)
 
     def test_backoff_delay_escalates_and_caps_with_jitter(
         self,
