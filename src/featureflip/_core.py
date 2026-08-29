@@ -14,6 +14,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -23,6 +24,11 @@ from featureflip._events import EventProcessor
 from featureflip._http import HttpClient
 from featureflip._polling import PollingHandler
 from featureflip._streaming import StreamingHandler
+from featureflip._updates import (
+    FlagUpdateListener,
+    add_prerequisite_dependents,
+    diff_snapshot,
+)
 from featureflip.config import Config
 from featureflip.context import EvaluationContext
 from featureflip.detail import EvaluationDetail, EvaluationReason
@@ -31,6 +37,8 @@ from featureflip.exceptions import InitializationError
 from featureflip.inspector import EvaluationEvent
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from featureflip.inspector import EvaluationInspector
     from featureflip.models import FlagConfiguration, Segment
 
@@ -114,6 +122,18 @@ class _SharedFeatureflipCore:
         self._flags_lock = threading.RLock()
         self._initialized = threading.Event()
 
+        # False until the first snapshot lands. The first one establishes a
+        # baseline SILENTLY: a cold load is not a configuration change, and
+        # OpenFeature-style consumers signal it with a readiness event instead.
+        self._has_snapshot = False
+
+        # Update listeners live on the core, so they fire regardless of which
+        # handle triggered the update; handles drop their own on close.
+        # A dedicated lock — taking _flags_lock to notify would hold the store
+        # for the duration of arbitrary user callbacks.
+        self._update_listeners: list[FlagUpdateListener] = []
+        self._update_listeners_lock = threading.Lock()
+
         self._evaluator = FlagEvaluator()
 
         self._http_client: HttpClient | None = None
@@ -124,6 +144,10 @@ class _SharedFeatureflipCore:
         # Test modes bypass all network and threading
         if test_mode_values is not None or test_mode_flags is not None:
             self._initialized.set()
+            # The store is already populated, so a later snapshot pushed in by a
+            # test is a real change and must be diffed, not swallowed as a
+            # baseline.
+            self._has_snapshot = True
             return
 
         # Production path: requires a real SDK key
@@ -385,8 +409,8 @@ class _SharedFeatureflipCore:
             future = executor.submit(self._http_client.get_flags)
             try:
                 flags, segments = future.result(timeout=self._config.init_timeout)
-                self._update_flags(flags)
-                self._update_segments(segments)
+                # Establishes the baseline; fires nothing (_has_snapshot False).
+                self._apply_snapshot(flags, segments)
                 self._initialized.set()
                 logger.info("client_initialized", flag_count=len(flags))
             except FuturesTimeoutError as e:
@@ -396,19 +420,102 @@ class _SharedFeatureflipCore:
             except Exception as e:
                 raise InitializationError(f"Failed to initialize: {e}") from e
 
-    def _update_flags(self, flags: list[FlagConfiguration]) -> None:
-        with self._flags_lock:
-            for flag in flags:
-                self._flags[flag.key] = flag
+    def _apply_snapshot(
+        self,
+        flags: list[FlagConfiguration],
+        segments: list[Segment] | None,
+    ) -> None:
+        """Replace the store with a full snapshot and notify what changed.
 
-    def _update_segments(self, segments: list[Segment]) -> None:
+        Every source of a full snapshot funnels through here — the initial
+        fetch, each poll tick, and the SSE ``sync``/segment-refetch path — so
+        the baseline rule and the diff are applied uniformly.
+
+        ``segments=None`` means "this source did not carry segments"; the
+        existing segments are kept and excluded from the diff, rather than
+        being treated as deleted.
+        """
         with self._flags_lock:
-            for segment in segments:
-                self._segments[segment.key] = segment
+            if self._has_snapshot:
+                changed = diff_snapshot(
+                    self._flags,
+                    self._segments,
+                    flags,
+                    segments if segments is not None else self._segments.values(),
+                )
+            else:
+                # First snapshot: establish the baseline silently.
+                changed = []
+
+            self._flags = {flag.key: flag for flag in flags}
+            if segments is not None:
+                self._segments = {segment.key: segment for segment in segments}
+            self._has_snapshot = True
+
+        # Outside the lock: listeners are user code and may re-enter the client.
+        self._notify_update_listeners(changed)
 
     def _update_single_flag(self, flag: FlagConfiguration) -> None:
         with self._flags_lock:
+            previous = self._flags.get(flag.key)
             self._flags[flag.key] = flag
+            # A re-delivered identical config is not a change. The SSE path can
+            # re-fetch the same flag (reconnect, duplicate event), and reporting
+            # those would make the hook noisy in exactly the way the snapshot
+            # baseline exists to prevent.
+            changed = (
+                self._with_prerequisite_dependents_locked(flag.key)
+                if previous != flag
+                else []
+            )
+        self._notify_update_listeners(changed)
+
+    def _with_prerequisite_dependents_locked(self, key: str) -> list[str]:
+        """``key`` plus every flag transitively depending on it. Caller holds the lock.
+
+        The single-key delta paths (SSE ``flag.created``/``flag.updated``/
+        ``flag.deleted``) need the same fan-out as a full snapshot diff: the
+        event names one flag, but each of its dependents changes evaluated
+        value too.
+
+        Reads the post-mutation store, so an upserted flag is included and a
+        deleted flag's dependents — which still carry the now-dangling
+        prerequisite row — remain reachable.
+        """
+        changed = {key}
+        add_prerequisite_dependents(self._flags.values(), changed)
+        return sorted(changed)
+
+    # --- Update listeners ---
+
+    def on_update(self, listener: FlagUpdateListener) -> Callable[[], None]:
+        """Register a flag-update listener. Returns an unsubscribe callable."""
+        with self._update_listeners_lock:
+            self._update_listeners.append(listener)
+        return lambda: self.off_update(listener)
+
+    def off_update(self, listener: FlagUpdateListener) -> None:
+        """Remove a listener. Removing one that isn't registered is a no-op."""
+        with self._update_listeners_lock, suppress(ValueError):
+            self._update_listeners.remove(listener)
+
+    def _notify_update_listeners(self, keys: list[str]) -> None:
+        """Fire listeners with ``keys``. No-op when nothing changed.
+
+        A throwing listener is isolated: it neither breaks the streaming/polling
+        callback that produced the update nor stops the remaining listeners.
+        Each listener gets its own copy, so one mutating the list cannot corrupt
+        what the others see.
+        """
+        if not keys:
+            return
+        with self._update_listeners_lock:
+            listeners = list(self._update_listeners)
+        for listener in listeners:
+            try:
+                listener(list(keys))
+            except Exception as e:
+                logger.warning("flag_update_listener_error", error=str(e))
 
     # --- Streaming / polling callbacks ---
 
@@ -423,7 +530,15 @@ class _SharedFeatureflipCore:
 
     def _on_streaming_flag_deleted(self, key: str) -> None:
         with self._flags_lock:
-            self._flags.pop(key, None)
+            # Dependents resolved from the POST-delete store: they still carry
+            # the now-dangling prerequisite row, and their evaluated value has
+            # changed even though their own config has not.
+            changed = (
+                self._with_prerequisite_dependents_locked(key)
+                if self._flags.pop(key, None) is not None
+                else []
+            )
+        self._notify_update_listeners(changed)
 
     def _on_streaming_segment_updated(self) -> None:
         try:
@@ -434,9 +549,7 @@ class _SharedFeatureflipCore:
             # (drop flags/segments deleted server-side) rather than per-key
             # merging — otherwise a delete only lands via a later flag.deleted
             # delta or a poll/sync full-replace. Mirrors _on_polling_update.
-            with self._flags_lock:
-                self._flags = {flag.key: flag for flag in flags}
-                self._segments = {segment.key: segment for segment in segments}
+            self._apply_snapshot(flags, segments)
         except Exception as e:
             logger.warning("streaming_segment_refetch_error", error=str(e))
 
@@ -449,10 +562,7 @@ class _SharedFeatureflipCore:
         segments: list[Segment] | None = None,
     ) -> None:
         """Handle polling update. Polling receives full snapshots — replace store."""
-        with self._flags_lock:
-            self._flags = {flag.key: flag for flag in flags}
-            if segments is not None:
-                self._segments = {segment.key: segment for segment in segments}
+        self._apply_snapshot(flags, segments)
 
     def _on_polling_error(self, error: Exception) -> None:
         logger.warning("polling_error", error=str(error))
@@ -618,6 +728,12 @@ class _SharedFeatureflipCore:
             except Exception as e:
                 logger.warning("http_client_close_error", error=str(e))
             self._http_client = None
+
+        # Last, so a listener cannot be fired by a handler still winding down.
+        # Nothing will update the store again, and holding these would keep
+        # references to consumer objects alive for the life of the process.
+        with self._update_listeners_lock:
+            self._update_listeners.clear()
 
         logger.info("core_shut_down")
 

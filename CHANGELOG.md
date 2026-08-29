@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.7.0 — 2026-08-28
+
+### Added
+
+- `FeatureflipClient.on_update(listener)` subscribes to flag-configuration changes, returning a callable that unsubscribes. The listener receives the flag keys whose configuration changed, batched into one call per update. This is the change channel the OpenFeature provider needs to emit `PROVIDER_CONFIGURATION_CHANGED`, and it brings Python level with the js/node SDKs (2.2.0) and the C# SDK. (#2586)
+
+  The initial flag load does not fire — a cold start is not a change. Beyond flags whose own configuration changed, an update also names the flags whose evaluated value moves as a result: those referencing an edited segment (a segment edit alters targeting without bumping any flag's version), and those depending on a changed flag through a prerequisite. A listener that raises is logged and isolated, affecting neither flag delivery nor the other listeners.
+
+  Listeners fire on the SDK's streaming or polling thread, so they must not block.
+
+### Fixed
+
+- The distribution now ships the PEP 561 `py.typed` marker. `pyproject.toml` has advertised the `Typing :: Typed` classifier since the first release, but without the marker file a type checker in a consuming project ignores the SDK's inline annotations entirely and reports `Skipping analyzing "featureflip": module is installed, but missing library stubs or py.typed marker`. Every annotation the SDK carries was invisible downstream. (#2586)
+
 ## 2.6.0 — 2026-08-26
 
 ### Changed

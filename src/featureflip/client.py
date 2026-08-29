@@ -12,6 +12,9 @@ from featureflip.config import Config
 from featureflip.detail import EvaluationDetail, EvaluationReason
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from featureflip._updates import FlagUpdateListener
     from featureflip.inspector import EvaluationInspector
 
 logger = structlog.get_logger()
@@ -43,6 +46,19 @@ class FeatureflipClient:
         >>> with FeatureflipClient(sdk_key="sdk-xxx") as client:
         ...     value = client.variation("flag", {"user_id": "123"}, default=False)
     """
+
+    #: Listeners registered through THIS handle. The core outlives a handle
+    #: whenever another one shares the SDK key, so closing has to remove exactly
+    #: these rather than clearing the core's list.
+    #:
+    #: A class-level EMPTY TUPLE, and rebound (never mutated) per instance by
+    #: :meth:`on_update`. Handles are also built by ``object.__new__`` — by
+    #: :meth:`for_testing` and by tests wrapping an existing core — which skips
+    #: ``__init__`` entirely, so an attribute only assigned there would be
+    #: missing on those handles and blow up in :meth:`close`. The immutable
+    #: default makes every construction path correct without each having to
+    #: remember this field.
+    _own_listeners: tuple[FlagUpdateListener, ...] = ()
 
     def __init__(
         self,
@@ -165,6 +181,55 @@ class FeatureflipClient:
             return
         self._core.flush()
 
+    # --- Flag update notifications ---
+
+    def on_update(self, listener: FlagUpdateListener) -> Callable[[], None]:
+        """Subscribe to flag-configuration changes.
+
+        The listener is called with the flag keys whose configuration changed,
+        batched into one call per update. It fires on the SDK's streaming or
+        polling thread, so it must not block: a slow listener delays flag
+        delivery and, on the SSE path, can stall the connection.
+
+        The initial flag load does NOT fire — a cold start is not a change.
+        Only later updates do. Keys are reported when a flag is added, removed
+        or modified, and additionally for flags dragged along by the change:
+        those referencing an edited segment, and those depending on a changed
+        flag through a prerequisite (their evaluated value moves even though
+        their own configuration did not).
+
+        An exception raised by a listener is logged and swallowed; it does not
+        affect flag delivery or the other listeners.
+
+        Args:
+            listener: Called with the changed flag keys.
+
+        Returns:
+            A callable that unsubscribes. Subscriptions are also dropped when
+            this handle is closed.
+
+        Example:
+            >>> unsubscribe = client.on_update(lambda keys: print("changed:", keys))
+            >>> unsubscribe()
+        """
+        if self._closed:
+            # Nothing will ever fire, so hand back a no-op rather than
+            # registering on a core this handle no longer participates in.
+            return lambda: None
+        unsubscribe = self._core.on_update(listener)
+        # Rebound, not mutated — see the class-level declaration.
+        self._own_listeners = (*self._own_listeners, listener)
+        return unsubscribe
+
+    def off_update(self, listener: FlagUpdateListener) -> None:
+        """Remove a previously registered listener. Unregistered is a no-op."""
+        self._core.off_update(listener)
+        self._own_listeners = tuple(
+            registered
+            for registered in self._own_listeners
+            if registered is not listener
+        )
+
     # --- Lifecycle ---
 
     @property
@@ -192,6 +257,11 @@ class FeatureflipClient:
         if self._closed:
             return
         self._closed = True
+        # Before the release: the core may stay alive for other handles, and
+        # this handle's listeners must stop firing regardless.
+        for listener in self._own_listeners:
+            self._core.off_update(listener)
+        self._own_listeners = ()
         self._core._release()
 
     def __enter__(self) -> FeatureflipClient:

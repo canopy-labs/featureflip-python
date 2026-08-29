@@ -1,5 +1,6 @@
 """Featureflip Python SDK."""
 
+from featureflip._updates import FlagUpdateListener
 from featureflip._version import __version__
 from featureflip.client import FeatureflipClient
 from featureflip.config import Config
@@ -43,6 +44,7 @@ __all__: list[str] = [
     "FeatureflipError",
     "FlagConfiguration",
     "FlagType",
+    "FlagUpdateListener",
     "InitializationError",
     "Prerequisite",
     "Segment",
