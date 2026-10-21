@@ -846,7 +846,8 @@ def _configs_equal(a: Config, b: Config) -> bool:
 
     ``inspectors`` is deliberately excluded: callbacks aren't structurally
     comparable, and a differing callback must not trigger the "different
-    options" warning for a shared core.
+    options" warning for a shared core. So are ``wrapper_name`` and
+    ``wrapper_version``: they identify the caller rather than change behavior.
     """
     return (
         a.base_url == b.base_url

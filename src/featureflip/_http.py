@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import httpx
 import structlog
 
-from featureflip._version import USER_AGENT
+from featureflip._version import user_agent
 from featureflip.exceptions import UnevaluableEntityError
 from featureflip.models import (
     Condition,
@@ -58,7 +58,7 @@ class HttpClient:
             ),
             headers={
                 "Authorization": sdk_key,
-                "User-Agent": USER_AGENT,
+                "User-Agent": user_agent(config.wrapper_name, config.wrapper_version),
             },
         )
 

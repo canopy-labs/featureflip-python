@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.8.0 — 2026-10-20
+
+### Added
+
+- `Config.wrapper_name` and `wrapper_version`, for libraries that wrap this SDK, such as the OpenFeature provider. The wrapper's token follows the SDK's in the User-Agent on the flag fetch, the event post and the SSE stream, e.g. `featureflip-python/<version> my-wrapper/1.0.0`, so usage through the wrapper can be counted. A name that is not a valid HTTP product token is ignored with a warning rather than failing construction, and the two fields do not trigger the config-mismatch warning. (#4153)
+
 ## 2.7.0 — 2026-08-28
 
 ### Added

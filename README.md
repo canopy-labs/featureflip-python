@@ -97,6 +97,31 @@ client.identify({"user_id": "123", "email": "user@example.com", "plan": "pro"})
 client.flush()
 ```
 
+Featureflip counts each event name, per environment. The metadata you pass is transmitted with the event but is not stored, and event counts are not surfaced in the app or API.
+
+## Flag Change Notifications
+
+Subscribe to flag-configuration changes. The listener receives the keys affected
+by each change, batched into one call:
+
+```python
+def on_flags_changed(keys):
+    print("flags changed:", keys)
+
+unsubscribe = client.on_update(on_flags_changed)
+...
+unsubscribe()   # or client.off_update(on_flags_changed)
+```
+
+The initial flag load does not fire. Beyond flags whose own configuration
+changed, an update also names flags whose evaluated value moves as a result:
+those referencing an edited segment, and those depending on a changed flag
+through a prerequisite.
+
+Listeners run on the SDK's streaming or polling thread, so they must not block.
+A listener that raises is logged and isolated, affecting neither flag delivery
+nor the other listeners.
+
 ## Testing
 
 Use the test client for deterministic unit tests:
@@ -125,6 +150,7 @@ client.set_test_value("my-feature", False)
 
 - **Client-side evaluation** - Near-zero latency after initialization
 - **Real-time updates** - SSE streaming with polling fallback
+- **Change notifications** - `on_update()` reports exactly which flags moved
 - **Event tracking** - Automatic batching and flushing of analytics events
 - **Test support** - `for_testing()` factory for deterministic unit tests
 - **Type-safe** - Full type hints with mypy strict mode compliance

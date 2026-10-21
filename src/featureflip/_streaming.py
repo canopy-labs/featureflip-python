@@ -12,7 +12,7 @@ import structlog
 from httpx_sse import connect_sse
 
 from featureflip._polling import PollingHandler
-from featureflip._version import USER_AGENT
+from featureflip._version import user_agent
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -261,7 +261,8 @@ class StreamingHandler:
         """
         return {
             "Authorization": self._sdk_key,
-            "User-Agent": USER_AGENT,
+            # Built per connect from config, so it matches HttpClient's (#4153).
+            "User-Agent": user_agent(self._config.wrapper_name, self._config.wrapper_version),
             "Accept": "text/event-stream",
         }
 

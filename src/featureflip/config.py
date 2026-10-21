@@ -30,6 +30,15 @@ class Config:
             ``_core._configs_equal``): callbacks aren't structurally comparable
             and a differing callback must not trigger the "different options"
             warning.
+        wrapper_name: Name of a library that wraps this SDK, such as an
+            OpenFeature provider. Sent after the SDK's own token in the
+            User-Agent (``featureflip-python/<version> my-wrapper/1.0.0``) so
+            usage through the wrapper can be counted. Must be a valid HTTP
+            product token; an invalid one is ignored with a warning. Leave unset
+            when calling the SDK directly. Excluded from the config-equality
+            comparison: it identifies the caller rather than changing behavior.
+        wrapper_version: Version of the wrapper named by ``wrapper_name``.
+            Optional.
     """
 
     base_url: str = "https://eval.featureflip.io"
@@ -42,6 +51,8 @@ class Config:
     flush_batch_size: int = 100
     init_timeout: float = 10.0
     inspectors: list[EvaluationInspector] = field(default_factory=list)
+    wrapper_name: str | None = None
+    wrapper_version: str | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize configuration values."""
