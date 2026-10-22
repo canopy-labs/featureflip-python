@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import structlog
 
+from featureflip._canonical_number import canonical_decimal, canonical_number
 from featureflip._semver import compare_semver
+from featureflip._unbucketable import warn_unbucketable
 from featureflip.detail import EvaluationDetail, EvaluationReason
 
 if TYPE_CHECKING:
@@ -556,7 +559,7 @@ class FlagEvaluator:
         hash_int = int.from_bytes(hash_bytes[:4], "little", signed=False)
         return hash_int % 100
 
-    def resolve_rollout(self, serve: ServeConfig, context: EvaluationContext) -> str:
+    def resolve_rollout(self, serve: ServeConfig, context: EvaluationContext) -> str | None:
         """Resolve which variation to serve for a rollout.
 
         Args:
@@ -564,11 +567,23 @@ class FlagEvaluator:
             context: The evaluation context with user attributes.
 
         Returns:
-            The variation key to serve based on the bucket assignment.
+            The variation key to serve based on the bucket assignment, or None
+            when the context can't be bucketed (the bucket-by value is missing,
+            None or an empty string). The caller skips the serve (#4236).
         """
         bucket_by = serve.bucket_by or "userId"
         bucket_value = context.get_attribute(bucket_by)
-        bucket_value_str = str(bucket_value) if bucket_value is not None else ""
+        if bucket_value is None:
+            bucket_value_str = ""
+        elif isinstance(bucket_value, bool):
+            # JSON's spelling, like the engine; str(True) would be "True" (#4236).
+            bucket_value_str = "true" if bucket_value else "false"
+        elif isinstance(bucket_value, float):
+            bucket_value_str = canonical_number(bucket_value)
+        elif isinstance(bucket_value, Decimal):
+            bucket_value_str = canonical_decimal(bucket_value)
+        else:
+            bucket_value_str = str(bucket_value)
 
         # A Rollout serve can arrive with no weighted variations — env-level PercentageRollout
         # has nowhere to store per-variation weights, so the mapper emits type=Rollout with no
@@ -577,13 +592,12 @@ class FlagEvaluator:
         if not serve.variations:
             return serve.variation or ""
 
-        # Keyless user contexts can't be bucketed. Rather than hashing the empty
-        # value into an arbitrary salt-dependent bucket, serve the control (first)
-        # variation deterministically. The engine assigns a random GUID per eval
-        # (spreading anonymous users over HTTP); local SDK eval is deterministic, so
-        # parity is guaranteed only for keyed contexts (#1457).
-        if bucket_value_str == "" and bucket_by in ("userId", "user_id") and serve.variations:
-            return serve.variations[0].key
+        # A context with no value for the bucket-by attribute (missing, None or "")
+        # can't be bucketed. Hashing "" would pin every such context to one
+        # salt-dependent bucket, so signal the caller to skip this serve instead
+        # (#4236). Whitespace, "0" and False are real values and bucket normally.
+        if bucket_value_str == "":
+            return None
 
         bucket = self.compute_bucket(serve.salt or "", bucket_value_str)
 
@@ -749,9 +763,21 @@ class FlagEvaluator:
                 )
 
             if conditions_match:
-                variation_key = self._resolve_serve(rule.serve, context)
+                resolved = self._resolve_serve(rule.serve, context)
+                if resolved is None:
+                    warn_unbucketable(flag.key, rule.id, rule.serve.bucket_by or "userId")
+                    continue
+                variation_key = resolved
                 variation = flag.get_variation(variation_key)
-                value = variation.value if variation else None
+                if variation is None:
+                    # The served key names no variation: malformed config. Report ERROR
+                    # (no rule id) with the served key, like the engine's ServeVariation (#4236).
+                    result = EvaluationDetail(
+                        value=None, reason=EvaluationReason.ERROR, variation_key=variation_key
+                    )
+                    memo[flag.key] = result
+                    return result
+                value = variation.value
                 result = EvaluationDetail(
                     value=value,
                     reason=EvaluationReason.RULE_MATCH,
@@ -762,9 +788,19 @@ class FlagEvaluator:
                 return result
 
         # Step 4: No rules matched, use fallthrough
-        variation_key = self._resolve_serve(flag.fallthrough, context)
+        resolved = self._resolve_serve(flag.fallthrough, context)
+        if resolved is None:
+            warn_unbucketable(flag.key, None, flag.fallthrough.bucket_by or "userId")
+            resolved = flag.fallthrough.variation or ""
+        variation_key = resolved
         variation = flag.get_variation(variation_key)
-        value = variation.value if variation else None
+        if variation is None:
+            result = EvaluationDetail(
+                value=None, reason=EvaluationReason.ERROR, variation_key=variation_key
+            )
+            memo[flag.key] = result
+            return result
+        value = variation.value
         result = EvaluationDetail(
             value=value,
             reason=EvaluationReason.FALLTHROUGH,
@@ -780,9 +816,19 @@ class FlagEvaluator:
         *,
         prerequisite_key: str | None = None,
     ) -> EvaluationDetail:
-        """Build an EvaluationDetail that serves the flag's off variation."""
+        """Build an EvaluationDetail that serves the flag's off variation.
+
+        An off variation the flag doesn't define is malformed config: report ERROR
+        (value None, the key kept), like the engine's ServeVariation (#4236).
+        """
         variation = flag.get_variation(flag.off_variation)
-        value = variation.value if variation else None
+        if variation is None:
+            return EvaluationDetail(
+                value=None,
+                reason=EvaluationReason.ERROR,
+                variation_key=flag.off_variation,
+            )
+        value = variation.value
         return EvaluationDetail(
             value=value,
             reason=reason,
@@ -790,7 +836,7 @@ class FlagEvaluator:
             prerequisite_key=prerequisite_key,
         )
 
-    def _resolve_serve(self, serve: ServeConfig, context: EvaluationContext) -> str:
+    def _resolve_serve(self, serve: ServeConfig, context: EvaluationContext) -> str | None:
         """Resolve which variation key to serve.
 
         Args:
@@ -798,7 +844,8 @@ class FlagEvaluator:
             context: The evaluation context with user attributes.
 
         Returns:
-            The variation key to serve.
+            The variation key to serve, or None when a rollout can't bucket the
+            context (never for a FIXED serve).
         """
         if serve.type == ServeType.FIXED:
             return serve.variation or ""

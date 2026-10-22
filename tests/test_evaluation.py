@@ -1016,12 +1016,8 @@ class TestRolloutResolution:
 
         assert evaluator.resolve_rollout(serve, ctx1) == evaluator.resolve_rollout(serve, ctx2)
 
-    def test_resolve_rollout_keyless_serves_control(self, evaluator: FlagEvaluator) -> None:
-        """Keyless/anonymous user contexts serve the control (first) variation.
-
-        A thin control weight (1) ensures the old empty-value hash collapse would
-        NOT land on the control, so this would have failed pre-fix (#1457).
-        """
+    def test_resolve_rollout_keyless_cannot_bucket(self, evaluator: FlagEvaluator) -> None:
+        """A keyless context can't be bucketed: the resolver signals None (#4236)."""
         from featureflip.models import ServeConfig, ServeType, WeightedVariation
 
         serve = ServeConfig(
@@ -1034,14 +1030,24 @@ class TestRolloutResolution:
             ],
         )
 
-        # Empty/keyless context: no userId/user_id attribute.
-        ctx = EvaluationContext.from_dict({})
+        assert evaluator.resolve_rollout(serve, EvaluationContext.from_dict({})) is None
 
-        # Serves the control (first) variation deterministically...
-        assert evaluator.resolve_rollout(serve, ctx) == "on"
-        # ...and is stable across repeated evals.
-        for _ in range(20):
-            assert evaluator.resolve_rollout(serve, ctx) == "on"
+    def test_resolve_rollout_empty_string_cannot_bucket_but_whitespace_zero_false_do(
+        self, evaluator: FlagEvaluator
+    ) -> None:
+        from featureflip.models import ServeConfig, ServeType, WeightedVariation
+
+        serve = ServeConfig(
+            type=ServeType.ROLLOUT,
+            bucket_by="k",
+            salt="s",
+            variations=[WeightedVariation(key="a", weight=50), WeightedVariation(key="b", weight=50)],
+        )
+        for missing in (None, ""):
+            assert evaluator.resolve_rollout(serve, EvaluationContext.from_dict({"k": missing})) is None
+        assert evaluator.resolve_rollout(serve, EvaluationContext.from_dict({})) is None
+        for present in (" ", "0", 0, False):
+            assert evaluator.resolve_rollout(serve, EvaluationContext.from_dict({"k": present})) in ("a", "b")
 
     def test_resolve_rollout_no_variations_serves_default(self, evaluator: FlagEvaluator) -> None:
         """A Rollout serve with no weighted variations degrades to the default variation.
@@ -1061,6 +1067,195 @@ class TestRolloutResolution:
         ctx = EvaluationContext.from_dict({"userId": "user-1"})
 
         assert evaluator.resolve_rollout(serve, ctx) == "off"
+
+
+class TestUnbucketableRollout:
+    """A rollout that can't bucket the context is skipped (#4236)."""
+
+    @pytest.fixture
+    def evaluator(self) -> FlagEvaluator:
+        return FlagEvaluator()
+
+    @staticmethod
+    def _flag(key: str, *, enabled: bool = True, bucket_by: str = "userId", second_rule: bool = False, rule_serve=None, fallthrough=None, no_rules: bool = False):  # type: ignore[no-untyped-def]
+        from featureflip.models import (
+            FlagConfiguration,
+            FlagType,
+            ServeConfig,
+            ServeType,
+            TargetingRule,
+            Variation,
+            WeightedVariation,
+        )
+
+        rollout = ServeConfig(
+            type=ServeType.ROLLOUT,
+            bucket_by=bucket_by,
+            salt="salt",
+            variations=[
+                WeightedVariation(key="on", weight=1),
+                WeightedVariation(key="off", weight=99),
+            ],
+        )
+        rules = [
+            TargetingRule(id="r1", priority=1, condition_groups=[], serve=rule_serve or rollout)
+        ]
+        if second_rule:
+            rules.append(
+                TargetingRule(
+                    id="r2",
+                    priority=2,
+                    condition_groups=[],
+                    serve=ServeConfig(type=ServeType.FIXED, variation="mid"),
+                )
+            )
+        return FlagConfiguration(
+            key=key,
+            version=1,
+            type=FlagType.STRING,
+            enabled=enabled,
+            variations=[
+                Variation(key="on", value="on"),
+                Variation(key="off", value="off"),
+                Variation(key="mid", value="mid"),
+                Variation(key="fall", value="fall"),
+            ],
+            rules=[] if no_rules else rules,
+            fallthrough=fallthrough or ServeConfig(type=ServeType.FIXED, variation="fall"),
+            off_variation="off",
+        )
+
+    def test_rule_serving_unknown_variation_key_is_error(self, evaluator: FlagEvaluator) -> None:
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import ServeConfig, ServeType
+
+        flag = self._flag(
+            "ub-unknown", rule_serve=ServeConfig(type=ServeType.FIXED, variation="zzz")
+        )
+        result = evaluator.evaluate(flag, EvaluationContext.from_dict({}))
+        assert result.reason == EvaluationReason.ERROR
+        assert result.variation_key == "zzz"
+        assert result.rule_id is None
+        assert result.value is None
+
+    def test_rule_serving_variation_keyed_empty_matches(self, evaluator: FlagEvaluator) -> None:
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import (
+            FlagConfiguration,
+            ServeConfig,
+            ServeType,
+            Variation,
+        )
+
+        base = self._flag(
+            "ub-empty-key", rule_serve=ServeConfig(type=ServeType.FIXED, variation="")
+        )
+        flag = FlagConfiguration(
+            key=base.key,
+            version=base.version,
+            type=base.type,
+            enabled=True,
+            variations=[*base.variations, Variation(key="", value="empty")],
+            rules=list(base.rules),
+            fallthrough=base.fallthrough,
+            off_variation=base.off_variation,
+        )
+        result = evaluator.evaluate(flag, EvaluationContext.from_dict({}))
+        assert result.reason == EvaluationReason.RULE_MATCH
+        assert result.variation_key == ""
+        assert result.value == "empty"
+
+    def test_keyless_rollout_rule_falls_through(self, evaluator: FlagEvaluator) -> None:
+        from featureflip.detail import EvaluationReason
+
+        result = evaluator.evaluate(self._flag("ub-fall"), EvaluationContext.from_dict({}))
+        assert result.variation_key == "fall"
+        assert result.reason == EvaluationReason.FALLTHROUGH
+
+    def test_custom_bucket_by_missing_with_user_id_present_falls_through(
+        self, evaluator: FlagEvaluator
+    ) -> None:
+        from featureflip.detail import EvaluationReason
+
+        flag = self._flag("ub-custom", bucket_by="anonymous_id")
+        result = evaluator.evaluate(flag, EvaluationContext.from_dict({"user_id": "u1"}))
+        assert result.variation_key == "fall"
+        assert result.reason == EvaluationReason.FALLTHROUGH
+
+    def test_keyless_rollout_rule_then_fixed_rule_matches_next(
+        self, evaluator: FlagEvaluator
+    ) -> None:
+        from featureflip.detail import EvaluationReason
+
+        flag = self._flag("ub-next", second_rule=True)
+        result = evaluator.evaluate(flag, EvaluationContext.from_dict({}))
+        assert result.variation_key == "mid"
+        assert result.reason == EvaluationReason.RULE_MATCH
+        assert result.rule_id == "r2"
+
+    def test_fallthrough_rollout_unbucketable_serves_fallthrough_variation(
+        self, evaluator: FlagEvaluator
+    ) -> None:
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import ServeConfig, ServeType, WeightedVariation
+
+        flag = self._flag(
+            "ub-ft-rollout",
+            no_rules=True,
+            fallthrough=ServeConfig(
+                type=ServeType.ROLLOUT,
+                variation="fall",
+                salt="s",
+                variations=[
+                    WeightedVariation(key="on", weight=50),
+                    WeightedVariation(key="off", weight=50),
+                ],
+            ),
+        )
+        result = evaluator.evaluate(flag, EvaluationContext.from_dict({}))
+        assert result.variation_key == "fall"
+        assert result.reason == EvaluationReason.FALLTHROUGH
+
+    def test_warns_once_without_context_values(self, evaluator: FlagEvaluator) -> None:
+        from structlog.testing import capture_logs
+
+        flag = self._flag("ub-warn-once")
+        ctx = EvaluationContext.from_dict({"email": "secret@example.com"})
+        with capture_logs() as logs:
+            evaluator.evaluate(flag, ctx)
+            evaluator.evaluate(flag, ctx)
+        warns = [e for e in logs if e["event"] == "rollout_unbucketable"]
+        assert len(warns) == 1
+        assert warns[0]["flag_key"] == "ub-warn-once"
+        assert warns[0]["where"] == "rule r1"
+        assert warns[0]["bucket_by"] == "userId"
+        assert "secret@example.com" not in str(warns[0])
+
+    def test_disabled_flag_keyless_does_not_warn(self, evaluator: FlagEvaluator) -> None:
+        from structlog.testing import capture_logs
+
+        flag = self._flag("ub-disabled", enabled=False)
+        with capture_logs() as logs:
+            evaluator.evaluate(flag, EvaluationContext.from_dict({}))
+        assert [e for e in logs if e["event"] == "rollout_unbucketable"] == []
+
+    def test_no_variations_rollout_keyless_degrades_without_warning(
+        self, evaluator: FlagEvaluator
+    ) -> None:
+        from structlog.testing import capture_logs
+
+        from featureflip.detail import EvaluationReason
+        from featureflip.models import ServeConfig, ServeType
+
+        flag = self._flag(
+            "ub-degrade",
+            rule_serve=ServeConfig(type=ServeType.ROLLOUT, variation="mid", variations=None),
+        )
+        with capture_logs() as logs:
+            result = evaluator.evaluate(flag, EvaluationContext.from_dict({}))
+        assert result.variation_key == "mid"
+        assert result.reason == EvaluationReason.RULE_MATCH
+        assert [e for e in logs if e["event"] == "rollout_unbucketable"] == []
 
 
 class TestFlagEvaluation:
@@ -1963,3 +2158,65 @@ class TestPrerequisiteResolution:
         )
         assert "shared" in memo
         assert memo["shared"].reason == EvaluationReason.FLAG_DISABLED
+
+
+class TestUnknownOffVariation:
+    """An off variation the flag doesn't define is ERROR, like the engine (#4236)."""
+
+    @staticmethod
+    def _flag(key: str, *, enabled: bool = True, off: str = "off", prereq: str | None = None):  # type: ignore[no-untyped-def]
+        from featureflip.models import (
+            FlagConfiguration,
+            FlagType,
+            Prerequisite,
+            ServeConfig,
+            ServeType,
+            Variation,
+        )
+
+        return FlagConfiguration(
+            key=key,
+            version=1,
+            type=FlagType.STRING,
+            enabled=enabled,
+            variations=[Variation(key="on", value="on"), Variation(key="off", value="off")],
+            rules=[],
+            fallthrough=ServeConfig(type=ServeType.FIXED, variation="on"),
+            off_variation=off,
+            prerequisites=[Prerequisite(prerequisite_flag_key=prereq, expected_variation_key="on")]
+            if prereq
+            else [],
+        )
+
+    def test_disabled_flag_with_unknown_off_variation_is_error(self) -> None:
+        from featureflip.detail import EvaluationReason
+
+        r = FlagEvaluator().evaluate(
+            self._flag("f", enabled=False, off="zzz"), EvaluationContext.from_dict({})
+        )
+        assert r.reason == EvaluationReason.ERROR
+        assert r.variation_key == "zzz"
+        assert r.value is None
+
+    def test_failed_prerequisite_with_unknown_off_variation_is_error(self) -> None:
+        from featureflip.detail import EvaluationReason
+
+        main = self._flag("main", off="zzz", prereq="p")
+        parent = self._flag("p", enabled=False)
+        r = FlagEvaluator().evaluate(
+            main, EvaluationContext.from_dict({}), all_flags={"p": parent}
+        )
+        assert r.reason == EvaluationReason.ERROR
+        assert r.variation_key == "zzz"
+
+    def test_dependent_of_unknown_off_prerequisite_is_error_serving_its_own_off(self) -> None:
+        from featureflip.detail import EvaluationReason
+
+        parent = self._flag("p", enabled=False, off="zzz")
+        main = self._flag("main", prereq="p")
+        r = FlagEvaluator().evaluate(
+            main, EvaluationContext.from_dict({}), all_flags={"p": parent}
+        )
+        assert r.reason == EvaluationReason.ERROR
+        assert r.variation_key == "off"
+        assert r.value == "off"

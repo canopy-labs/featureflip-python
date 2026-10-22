@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.9.0 — 2026-10-22
+
+### Changed
+
+- A percentage rollout that can't bucket the context (no `user_id`, or no value for its bucket-by attribute) now skips the rule and evaluation continues with the next rule or the fallthrough. Previously the SDK served the rollout's first variation, which is the variation being rolled out. A warning is logged once per flag and rule. (#4236)
+- Boolean values used as a rollout bucket value now hash as `true`/`false` (previously `True`/`False`), matching the Evaluation API, so the same context gets the same variant in every SDK. Only a context whose user id is a boolean is affected. (This also changes how a boolean `user_id` reads in conditions on `user_id`.) (#4236)
+- `EvaluationContext.from_dict` keeps a `user_id` of `0` or `False` instead of treating the context as anonymous, so it is now bucketed in percentage rollouts. (#4236)
+- Decimal numbers used as a rollout bucket value now hash in one canonical spelling shared with the Evaluation API (for example `1.0` hashes as `1`), so the same context gets the same variant in every SDK. Integer values are unchanged. A context whose user id is a non-integer number may get a different variant. A `decimal.Decimal` value with no fractional part hashes as its exact integer digits; any other `Decimal` is converted to a float first. (#4236)
+- Malformed variation references now evaluate to reason `ERROR` the way the Evaluation API does. A rule or fallthrough that serves a key the flag doesn't define (the detail already reported `ERROR` and the default) no longer reports the rule id, and a served empty-string key with no empty-string variation is now an `ERROR` too. A flag whose prerequisite serves an undefined variation, or whose own off variation is undefined, now reports `ERROR` (still serving its off variation) instead of `PREREQUISITE_FAILED` or `FLAG_DISABLED`. (#4236)
+- `EvaluationContext.from_dict` formats a float or `Decimal` `user_id` canonically (for example `1.0` becomes `1`), so it buckets like the Evaluation API and every other SDK. (#4250)
+
 ## 2.8.0 — 2026-10-20
 
 ### Added

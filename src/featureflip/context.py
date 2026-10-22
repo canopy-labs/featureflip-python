@@ -7,7 +7,10 @@ environment attributes for flag evaluation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
+
+from featureflip._canonical_number import canonical_decimal, canonical_number
 
 
 @dataclass
@@ -56,9 +59,19 @@ class EvaluationContext:
         Returns:
             A new EvaluationContext instance.
         """
-        user_id = data.get("user_id") or data.get("userId")
-        if user_id is not None:
-            user_id = str(user_id)
+        # Only None and "" mean "no user id"; 0 and False are real values.
+        user_id = data.get("user_id")
+        if user_id is None or user_id == "":
+            user_id = data.get("userId")
+        if isinstance(user_id, bool):
+            # JSON's spelling, so a boolean id buckets like the engine's (str(False) is "False").
+            user_id = "true" if user_id else "false"
+        elif isinstance(user_id, float):
+            # Same spelling resolve_rollout hashes, so 1.0 buckets as "1" (#4250).
+            user_id = canonical_number(user_id)
+        elif isinstance(user_id, Decimal):
+            user_id = canonical_decimal(user_id)
+        user_id = str(user_id) if user_id is not None else None
 
         # Copy all attributes except user_id/userId into the attributes dict
         attributes = {k: v for k, v in data.items() if k not in ("user_id", "userId")}
