@@ -41,9 +41,12 @@ def canonical_number(x: float) -> str:
 
 
 def canonical_decimal(d: Decimal) -> str:
-    """Bucket text for a ``decimal.Decimal``: an integral value keeps its exact
-    integer digits (like the engine's raw integer text); anything else goes
-    through ``float`` and :func:`canonical_number`."""
-    if d.is_finite() and d == d.to_integral_value():
+    """Bucket text for a ``decimal.Decimal``: an integral value below 1e21 keeps
+    its exact integer digits (like the engine's raw integer text); anything else
+    goes through ``float`` and :func:`canonical_number`.
+
+    The 1e21 cap (#4246) is where ECMAScript spelling turns exponential. Without
+    it ``Decimal("1E+999999999")`` would expand to a billion digits per evaluation."""
+    if d.is_finite() and (d.is_zero() or d.adjusted() < 21) and d == d.to_integral_value():
         return str(int(d))
     return canonical_number(float(d))

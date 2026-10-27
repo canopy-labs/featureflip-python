@@ -83,6 +83,8 @@ class TestFromDictCanonicalUserId:
             (2.5e-7, "2.5e-7"),
             (1.5, "1.5"),
             (Decimal("1.0"), "1"),
+            # #4246: a huge-exponent Decimal goes through float, not a 100001-digit string.
+            (Decimal("1E+100000"), "Infinity"),
             (0, "0"),
             (42, "42"),
             (True, "true"),

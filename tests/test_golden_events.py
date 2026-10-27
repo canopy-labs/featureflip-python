@@ -26,6 +26,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from featureflip import Config, FeatureflipClient
+from featureflip._core import _reset_for_testing
+from featureflip._http import HttpClient
 
 VECTORS: list[dict[str, Any]] = json.loads(
     (Path(__file__).parent / "golden" / "vectors.json").read_text()
@@ -45,6 +47,13 @@ CAPABILITIES = {"mapContext", "anonymousContext"}
 
 RUNNABLE = [v for v in VECTORS if set(v.get("requires", [])) <= CAPABILITIES]
 
+# Every evaluation vector runs through BOTH read paths. variation_detail() once
+# recorded no event at all, which made every flag the OpenFeature provider reads
+# invisible to analytics (#4300); pinning it here keeps the two paths identical.
+CASES = [(v, "variation") for v in RUNNABLE] + [
+    (v, "variation_detail") for v in RUNNABLE if v["kind"] == "evaluation"
+]
+
 
 def test_has_vectors_to_run() -> None:
     assert len(VECTORS) > 0
@@ -52,13 +61,30 @@ def test_has_vectors_to_run() -> None:
 
 def test_executed_the_expected_number_of_vectors() -> None:
     """A runner that silently skips everything is worse than no runner at all."""
-    assert len(RUNNABLE) >= 13
+    assert len(RUNNABLE) >= 19
+    assert len(CASES) >= 25
 
 
-@pytest.mark.parametrize("vector", RUNNABLE, ids=lambda v: v["id"])
-def test_event_payload_vector(vector: dict[str, Any]) -> None:
+@pytest.mark.parametrize(
+    ("vector", "accessor"),
+    CASES,
+    ids=[f"{v['id']}-{accessor}" for v, accessor in CASES],
+)
+def test_event_payload_vector(vector: dict[str, Any], accessor: str) -> None:
+    _reset_for_testing()
+    flags, segments = [], []
+    if vector["kind"] == "evaluation":
+        # The real wire parser, fed the same snapshot envelope the server sends.
+        flags, segments = HttpClient.__new__(HttpClient).parse_flags_response(
+            {
+                "environment": "golden",
+                "version": 1,
+                "flags": vector["flags"],
+                "segments": vector["segments"],
+            }
+        )
     with patch("featureflip._core.HttpClient") as mock_http:
-        mock_http.return_value.get_flags.return_value = ([], [])
+        mock_http.return_value.get_flags.return_value = (flags, segments)
         client = FeatureflipClient(
             sdk_key=f"events-{vector['id']}",
             config=Config(streaming=False, send_events=False),
@@ -68,6 +94,10 @@ def test_event_payload_vector(vector: dict[str, Any]) -> None:
         try:
             if vector["kind"] == "identify":
                 client.identify(vector["context"])
+            elif vector["kind"] == "evaluation":
+                # Boolean read with a False default: every vector's served value
+                # is checked through the event, not the return value.
+                getattr(client, accessor)(vector["flagKey"], vector["context"], False)
             elif "metadata" in vector:
                 client.track(vector["eventKey"], vector["context"], vector["metadata"])
             else:
@@ -75,6 +105,7 @@ def test_event_payload_vector(vector: dict[str, Any]) -> None:
                 # put the same bytes on the wire as an explicitly empty bag.
                 client.track(vector["eventKey"], vector["context"])
 
+            assert client._core._event_processor.queue_event.call_count == 1
             queued = client._core._event_processor.queue_event.call_args[0][0]
         finally:
             client.close()

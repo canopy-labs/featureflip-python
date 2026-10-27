@@ -47,6 +47,18 @@ logger = structlog.get_logger()
 T = TypeVar("T")
 
 
+# The wire spelling of each reason: one kebab-case category, identical in every
+# SDK so the Analytics source breakdown reads the same whichever reported it.
+_WIRE_REASONS: dict[EvaluationReason, str] = {
+    EvaluationReason.RULE_MATCH: "rule-match",
+    EvaluationReason.FALLTHROUGH: "fallthrough",
+    EvaluationReason.FLAG_DISABLED: "flag-disabled",
+    EvaluationReason.FLAG_NOT_FOUND: "flag-not-found",
+    EvaluationReason.PREREQUISITE_FAILED: "prerequisite-failed",
+    EvaluationReason.ERROR: "error",
+}
+
+
 def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
     """Drop the optional wire fields when they carry nothing.
 
@@ -665,13 +677,18 @@ class _SharedFeatureflipCore:
         key: str,
         context: dict[str, Any],
         variation_key: str | None,
+        reason: EvaluationReason | None = None,
+        rule_id: str | None = None,
+        prerequisite_key: str | None = None,
     ) -> None:
         """Queue an evaluation event (called by the handle's variation() method).
 
         Emits the backend SdkEventDto shape — top-level ``userId`` and
-        ``variation`` — mirroring the JS SDK. The backend has no context/value/
-        reason/ruleId fields, so they are not sent (System.Text.Json would drop
-        them and bind UserId/Variation to null; see #1920).
+        ``variation`` — mirroring the JS SDK (see #1920). ``reason`` is the
+        kebab-case category (never ``rule-match:{id}``); ``ruleId`` rides only
+        on a rule match, because an ERROR read can still carry the rule that
+        selected a malformed variation and that rule did not serve the traffic.
+        Absent optionals are omitted, never sent as null (#4268).
         """
         if self._event_processor is None:
             return
@@ -684,6 +701,14 @@ class _SharedFeatureflipCore:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
+        if variation_key is None:
+            event.pop("variation", None)
+        if prerequisite_key is not None:
+            event["prerequisiteKey"] = prerequisite_key
+        if reason is not None:
+            event["reason"] = _WIRE_REASONS[reason]
+            if reason is EvaluationReason.RULE_MATCH and rule_id is not None:
+                event["ruleId"] = rule_id
         self._event_processor.queue_event(event)
 
     # --- Shutdown ---

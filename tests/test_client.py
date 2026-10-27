@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from featureflip.models import (
     FlagType,
     ServeConfig,
     ServeType,
+    TargetingRule,
     Variation,
 )
 
@@ -28,6 +30,7 @@ def create_test_flag(
     key: str = "test-flag",
     value: Any = True,
     enabled: bool = True,
+    rules: list[TargetingRule] | None = None,
 ) -> FlagConfiguration:
     """Create a test flag configuration."""
     return FlagConfiguration(
@@ -39,7 +42,7 @@ def create_test_flag(
             Variation(key="on", value=value),
             Variation(key="off", value=not value if isinstance(value, bool) else None),
         ],
-        rules=[],
+        rules=rules or [],
         fallthrough=ServeConfig(type=ServeType.FIXED, variation="on"),
         off_variation="off",
     )
@@ -762,10 +765,10 @@ class TestEvaluationEventKeys:
         """Evaluation events carry only the backend SdkEventDto fields.
 
         The backend maps SdkEventDto -> SdkEvent with type/flagKey/userId/variation/
-        timestamp/metadata/prerequisiteKey and nothing else (see
-        Evaluation.Api Controllers/SdkController.RecordEvents). Sending context/value/
-        reason/ruleId is dead weight silently dropped by System.Text.Json. Regression
-        guard for #1920.
+        timestamp/metadata/prerequisiteKey/reason/ruleId and nothing else (see
+        Evaluation.Api Controllers/SdkController.RecordEvents). Sending context/value
+        is dead weight silently dropped by System.Text.Json (#1920). ``reason`` and
+        ``ruleId`` are real fields since #4268, sent only when the caller has them.
         """
         with patch("featureflip._core.HttpClient") as mock_http:
             mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
@@ -788,7 +791,118 @@ class TestEvaluationEventKeys:
             assert event["userId"] == "123"
             assert event["variation"] == "on"
             assert "timestamp" in event
-            # non-DTO fields must not be sent
-            for dead in ("context", "value", "reason", "ruleId", "rule_id"):
+            # non-DTO fields must not be sent, and reason/ruleId are omitted
+            # when the caller supplies none (#4268)
+            for dead in ("context", "value", "rule_id", "reason", "ruleId"):
                 assert dead not in event, f"Event should not carry '{dead}'"
             client.close()
+
+
+class TestEvaluationEventReason:
+    """The Evaluation event carries the reason category and, on a rule match, its id (#4268)."""
+
+    @staticmethod
+    def _event_for(flag: FlagConfiguration, default: Any = False) -> dict[str, Any]:
+        with patch("featureflip._core.HttpClient") as mock_http:
+            mock_http.return_value.get_flags.return_value = ([flag], [])
+            client = FeatureflipClient(
+                sdk_key="reason-key",
+                config=Config(streaming=False, send_events=False),
+            )
+            client._core._event_processor = MagicMock()
+            try:
+                client.variation(flag.key, {"user_id": "u1"}, default=default)
+                queued = client._core._event_processor.queue_event.call_args[0][0]
+            finally:
+                client.close()
+        return cast("dict[str, Any]", json.loads(json.dumps(queued)))
+
+    def test_fallthrough_has_reason_and_no_rule_id(self) -> None:
+        event = self._event_for(create_test_flag())
+        assert event["reason"] == "fallthrough"
+        assert "ruleId" not in event
+
+    def test_rule_match_carries_rule_id_beside_the_reason(self) -> None:
+        flag = create_test_flag(rules=[
+            TargetingRule(
+                id="rule-1",
+                priority=0,
+                condition_groups=[],
+                serve=ServeConfig(type=ServeType.FIXED, variation="off"),
+            )
+        ])
+        event = self._event_for(flag)
+        assert event["reason"] == "rule-match"
+        assert event["ruleId"] == "rule-1"
+
+    def test_error_read_with_a_rule_id_in_the_detail_sends_no_rule_id(self) -> None:
+        """A rule that serves a variation the flag does not define is an ERROR read."""
+        flag = create_test_flag(rules=[
+            TargetingRule(
+                id="rule-1",
+                priority=0,
+                condition_groups=[],
+                serve=ServeConfig(type=ServeType.FIXED, variation="ghost"),
+            )
+        ])
+        event = self._event_for(flag)
+        assert event["reason"] == "error"
+        assert "ruleId" not in event
+
+
+class TestVariationDetailTracking:
+    """variation_detail() records the same event variation() does (#4300).
+
+    It recorded none before, and the OpenFeature provider reads every flag through
+    it, so those flags looked never evaluated to staleness and the archive guard.
+    """
+
+    @staticmethod
+    def _client() -> FeatureflipClient:
+        with patch("featureflip._core.HttpClient") as mock_http:
+            mock_http.return_value.get_flags.return_value = ([create_test_flag()], [])
+            client = FeatureflipClient(
+                sdk_key="detail-key",
+                config=Config(streaming=False, send_events=False),
+            )
+        client._core._event_processor = MagicMock()
+        return client
+
+    def test_records_one_event_per_call(self) -> None:
+        client = self._client()
+        try:
+            detail = client.variation_detail("test-flag", {"user_id": "u1"}, False)
+            queue = client._core._event_processor.queue_event
+            assert queue.call_count == 1
+            event = queue.call_args[0][0]
+            assert event["flagKey"] == "test-flag"
+            assert event["userId"] == "u1"
+            assert event["variation"] == detail.variation_key
+            assert event["reason"] == "fallthrough"
+        finally:
+            client.close()
+
+    def test_track_false_records_nothing(self) -> None:
+        client = self._client()
+        try:
+            client.variation_detail("test-flag", {"user_id": "u1"}, False, track=False)
+            client._core._event_processor.queue_event.assert_not_called()
+        finally:
+            client.close()
+
+    def test_a_failing_event_queue_still_returns_the_detail(self) -> None:
+        client = self._client()
+        try:
+            client._core._event_processor.queue_event.side_effect = RuntimeError("full")
+            detail = client.variation_detail("test-flag", {"user_id": "u1"}, False)
+            assert detail.reason == EvaluationReason.FALLTHROUGH
+        finally:
+            client.close()
+
+    def test_a_closed_client_records_nothing(self) -> None:
+        client = self._client()
+        processor = client._core._event_processor
+        client.close()
+        detail = client.variation_detail("test-flag", {"user_id": "u1"}, False)
+        assert detail.reason == EvaluationReason.ERROR
+        processor.queue_event.assert_not_called()

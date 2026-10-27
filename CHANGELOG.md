@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.10.0 — 2026-10-26
+
+### Added
+
+- The `Evaluation` analytics event now carries `reason` (`rule-match`, `fallthrough`, `flag-disabled`, `prerequisite-failed`, `error` or `flag-not-found`), plus `ruleId` when the reason is `rule-match` and `prerequisiteKey` when a prerequisite failed, so the Analytics tab can show where flag traffic came from. Both are omitted when absent. The public API is unchanged. (#4268)
+
+### Fixed
+
+- `variation_detail()` now records an `Evaluation` event, exactly as `variation()` does. It recorded none before, so a flag read only through it (which includes every flag read through the OpenFeature provider) looked never evaluated to the Analytics tab, stale-flag detection and the archive guard. Pass `track=False` to skip the event, as with `variation()`. (#4300)
+- A `decimal.Decimal` rollout bucket value or `user_id` of 1e21 or more now converts to a float, like a non-integral one, instead of expanding to its full integer digits. A huge exponent such as `Decimal("1E+999999999")` no longer builds a billion-digit integer on every evaluation, and a value over 4300 digits no longer raises `ValueError`. A context bucketed on an integral `Decimal` at or above 1e21 may get a different variant. (#4246)
+
 ## 2.9.0 — 2026-10-22
 
 ### Changed

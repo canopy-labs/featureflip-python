@@ -120,11 +120,7 @@ class FeatureflipClient:
             value = detail.value if detail.value is not None else default
 
             if track:
-                self._core.queue_evaluation_event(
-                    key=key,
-                    context=context or {},
-                    variation_key=detail.variation_key,
-                )
+                self._track_evaluation(key, context, detail)
             return cast("T", value)
         except Exception as e:
             logger.warning("evaluation_error", key=key, error=str(e))
@@ -135,22 +131,46 @@ class FeatureflipClient:
         key: str,
         context: dict[str, Any],
         default: T,
+        track: bool = True,
     ) -> EvaluationDetail:
         """Evaluate a flag with detailed result.
 
-        Does NOT track an evaluation event (matches the pre-refactor behavior).
+        Tracks an evaluation event exactly as :meth:`variation` does, so a flag
+        read only through this method (as the OpenFeature provider reads every
+        flag) still counts in analytics, staleness and the archive guard (#4300).
 
         Args:
             key: Flag key to evaluate.
             context: Context dictionary with user attributes.
             default: Default value to return if flag is not found or on error.
+            track: Whether to track this evaluation event.
 
         Returns:
             EvaluationDetail with value, reason, and optional rule_id.
         """
         if self._closed:
             return EvaluationDetail(value=default, reason=EvaluationReason.ERROR)
-        return self._core.evaluate(key, context or {}, default)
+        detail = self._core.evaluate(key, context or {}, default)
+        if track:
+            try:
+                self._track_evaluation(key, context, detail)
+            except Exception as e:
+                # The read already succeeded; losing its analytics event must not
+                # cost the caller the detail.
+                logger.warning("evaluation_event_error", key=key, error=str(e))
+        return detail
+
+    def _track_evaluation(
+        self, key: str, context: dict[str, Any], detail: EvaluationDetail
+    ) -> None:
+        self._core.queue_evaluation_event(
+            key=key,
+            context=context or {},
+            variation_key=detail.variation_key,
+            reason=detail.reason,
+            rule_id=detail.rule_id,
+            prerequisite_key=detail.prerequisite_key,
+        )
 
     # --- Event tracking ---
 

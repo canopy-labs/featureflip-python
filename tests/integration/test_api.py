@@ -497,7 +497,8 @@ class TestEventWireShape:
         # backend DTO has no such fields — must not be sent
         assert "context" not in event
         assert "value" not in event
-        assert "reason" not in event
+        # the reason category rides on the event; no rule matched, so no ruleId (#4268)
+        assert event["reason"] == "fallthrough"
         assert "ruleId" not in event
 
     @respx.mock
