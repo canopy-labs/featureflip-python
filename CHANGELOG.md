@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.10.1 — 2026-10-28
+
+### Fixed
+
+- A boolean context attribute is now matched as `"true"`/`"false"` by string operators, not Python's `"True"`/`"False"`, so `MatchesRegex` agrees with server-side evaluation and every other SDK. Only a case-sensitive pattern on a boolean attribute changes: `^true$` now matches an attribute set to `True`, and `^True$` no longer does. (#1501)
+
 ## 2.10.0 — 2026-10-26
 
 ### Added

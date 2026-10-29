@@ -233,6 +233,45 @@
       "expectedMatch": true
     },
     {
+      "id": "c-bool-true-regex-lowercase",
+      "attribute": {
+        "type": "boolean",
+        "value": true
+      },
+      "operator": "MatchesRegex",
+      "values": [
+        "^true$"
+      ],
+      "negate": false,
+      "expectedMatch": true
+    },
+    {
+      "id": "c-bool-true-regex-capitalised",
+      "attribute": {
+        "type": "boolean",
+        "value": true
+      },
+      "operator": "MatchesRegex",
+      "values": [
+        "^True$"
+      ],
+      "negate": false,
+      "expectedMatch": false
+    },
+    {
+      "id": "c-bool-false-regex-lowercase",
+      "attribute": {
+        "type": "boolean",
+        "value": false
+      },
+      "operator": "MatchesRegex",
+      "values": [
+        "^false$"
+      ],
+      "negate": false,
+      "expectedMatch": true
+    },
+    {
       "id": "c-regex-cs-match",
       "attribute": {
         "type": "string",

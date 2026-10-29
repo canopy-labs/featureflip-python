@@ -172,7 +172,7 @@ class FlagEvaluator:
         # number, the equality-family operators compare numerically instead of
         # stringifying, so 1.0 matches "1" and 1 matches "1.0" — mirroring the
         # .NET engine. Python's bool is a subclass of int and MUST be excluded so
-        # True/False keep the string path (str(True) == "True", not "1").
+        # True/False keep the string path below rather than becoming 1/0.
         if (
             isinstance(attr_value, (int, float))
             and not isinstance(attr_value, bool)
@@ -184,7 +184,13 @@ class FlagEvaluator:
         # RegexOptions.None), and date Before/After (ISO "T"/"Z") — must see the
         # original casing; every other operator folds case here so it can match
         # case-insensitively.
-        str_value = str(attr_value)
+        # Booleans are JSON's lowercase "true"/"false", matching the engine and
+        # every other SDK — str(True) is "True", which MatchesRegex can tell
+        # apart (#1501).
+        if isinstance(attr_value, bool):
+            str_value = "true" if attr_value else "false"
+        else:
+            str_value = str(attr_value)
         values = [str(v) for v in condition.values]
         if condition.operator not in _CASE_SENSITIVE_OPERATORS:
             str_value = str_value.lower()
