@@ -13,6 +13,7 @@ import structlog
 from featureflip._canonical_number import canonical_decimal, canonical_number
 from featureflip._semver import compare_semver
 from featureflip._unbucketable import warn_unbucketable
+from featureflip.context import NON_SCALAR_TYPES
 from featureflip.detail import EvaluationDetail, EvaluationReason
 
 if TYPE_CHECKING:
@@ -575,11 +576,14 @@ class FlagEvaluator:
         Returns:
             The variation key to serve based on the bucket assignment, or None
             when the context can't be bucketed (the bucket-by value is missing,
-            None or an empty string). The caller skips the serve (#4236).
+            None, an empty string, or a list or mapping). The caller skips the
+            serve (#4236, #4572).
         """
-        bucket_by = serve.bucket_by or "userId"
+        bucket_by = serve.bucket_by or "user_id"
         bucket_value = context.get_attribute(bucket_by)
-        if bucket_value is None:
+        if bucket_value is None or isinstance(bucket_value, NON_SCALAR_TYPES):
+            # A list or mapping (a JSON array or object, empty or not) has no spelling
+            # every SDK shares, so it can't be bucketed, like a missing value (#4572).
             bucket_value_str = ""
         elif isinstance(bucket_value, bool):
             # JSON's spelling, like the engine; str(True) would be "True" (#4236).
@@ -771,7 +775,7 @@ class FlagEvaluator:
             if conditions_match:
                 resolved = self._resolve_serve(rule.serve, context)
                 if resolved is None:
-                    warn_unbucketable(flag.key, rule.id, rule.serve.bucket_by or "userId")
+                    warn_unbucketable(flag.key, rule.id, rule.serve.bucket_by or "user_id")
                     continue
                 variation_key = resolved
                 variation = flag.get_variation(variation_key)
@@ -796,7 +800,7 @@ class FlagEvaluator:
         # Step 4: No rules matched, use fallthrough
         resolved = self._resolve_serve(flag.fallthrough, context)
         if resolved is None:
-            warn_unbucketable(flag.key, None, flag.fallthrough.bucket_by or "userId")
+            warn_unbucketable(flag.key, None, flag.fallthrough.bucket_by or "user_id")
             resolved = flag.fallthrough.variation or ""
         variation_key = resolved
         variation = flag.get_variation(variation_key)

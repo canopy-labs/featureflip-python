@@ -6,11 +6,17 @@ environment attributes for flag evaluation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
 from featureflip._canonical_number import canonical_decimal, canonical_number
+
+# A list or mapping (a JSON array or object, empty or not) has no spelling every
+# SDK shares, so a rollout can't bucket on it (#4572).
+NON_SCALAR_TYPES = (list, tuple, Mapping, AbstractSet)
 
 
 @dataclass
@@ -59,9 +65,10 @@ class EvaluationContext:
         Returns:
             A new EvaluationContext instance.
         """
-        # Only None and "" mean "no user id"; 0 and False are real values.
+        # user_id is canonical; userId is accepted as an alias. Only None means
+        # "absent": "", 0 and False are real values and do not fall through.
         user_id = data.get("user_id")
-        if user_id is None or user_id == "":
+        if user_id is None:
             user_id = data.get("userId")
         if isinstance(user_id, bool):
             # JSON's spelling, so a boolean id buckets like the engine's (str(False) is "False").
@@ -71,6 +78,9 @@ class EvaluationContext:
             user_id = canonical_number(user_id)
         elif isinstance(user_id, Decimal):
             user_id = canonical_decimal(user_id)
+        elif isinstance(user_id, NON_SCALAR_TYPES):
+            # The engine's WireContext spells a non-scalar id "", so it can't bucket (#4572).
+            user_id = ""
         user_id = str(user_id) if user_id is not None else None
 
         # Copy all attributes except user_id/userId into the attributes dict

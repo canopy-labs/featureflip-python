@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.10.2 — 2026-10-30
+
+### Fixed
+
+- A rollout whose Bucket by value is a list, tuple, set or mapping (empty or not) can't be bucketed, so the rule is skipped like one with no value. It used to hash `str(value)`, which put the context in a different bucket than the evaluation engine and the other SDKs. A non-scalar `user_id` in `EvaluationContext.from_dict` becomes `""`, as in the engine. (#4572)
+- `user_id` is now the canonical user-identifier spelling. `EvaluationContext.from_dict` falls back to `userId` only when `user_id` is absent or `None`, so an empty-string `user_id` is a real value (it can't be bucketed) instead of silently switching to `userId`. A rollout with no Bucket by now defaults to `user_id`; `userId` is still accepted as input. (#4518)
+
 ## 2.10.1 — 2026-10-28
 
 ### Fixed

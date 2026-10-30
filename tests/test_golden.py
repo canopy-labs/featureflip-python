@@ -275,12 +275,24 @@ def test_date_grammar_vectors() -> None:
     _run_condition_vectors(VECTORS["dateGrammarVectors"])
 
 
+# Python is a map-context SDK and keeps the caller's identifier casing, so it runs every vector.
+_SUPPORTED_CAPABILITIES = {"mapContext", "exactCaseIdentity"}
+
+
 def test_flag_vectors() -> None:
     """Full flag evaluation: variation_key, value (JSON-equal), and reason."""
+    executed = 0
     for v in VECTORS["flagVectors"]:
+        if any(t not in _SUPPORTED_CAPABILITIES for t in v.get("requires", [])):
+            continue
+        executed += 1
         all_flags = {f["key"]: _parse_flag(f) for f in v["flags"]}
         segments = {s["key"]: _parse_segment(s) for s in v.get("segments", [])}
-        ctx = _context_from_fixture(v["context"])
+        if "wireContext" in v:
+            # A wireContext map is the caller's raw context, passed through verbatim.
+            ctx = EvaluationContext.from_dict(dict(v["wireContext"]))
+        else:
+            ctx = _context_from_fixture(v["context"])
 
         result = EV.evaluate(
             all_flags[v["flagKey"]],
@@ -303,6 +315,9 @@ def test_flag_vectors() -> None:
             f"[{v['id']}] reason={_normalize_reason(result)!r}, "
             f"expected {exp['reason']!r}"
         )
+
+    assert executed == len(VECTORS["flagVectors"]), "a flag vector was skipped"
+    assert executed >= 71, f"only {executed} flag vectors executed"
 
 
 # ---------------------------------------------------------------------------
