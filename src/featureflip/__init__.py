@@ -27,6 +27,7 @@ from featureflip.models import (
     Variation,
     WeightedVariation,
 )
+from featureflip.snapshot import FileSnapshotStore, SnapshotStore, StartupInfo
 
 __all__: list[str] = [
     "Condition",
@@ -42,6 +43,7 @@ __all__: list[str] = [
     "EvaluationReason",
     "FeatureflipClient",
     "FeatureflipError",
+    "FileSnapshotStore",
     "FlagConfiguration",
     "FlagType",
     "FlagUpdateListener",
@@ -50,6 +52,8 @@ __all__: list[str] = [
     "Segment",
     "ServeConfig",
     "ServeType",
+    "SnapshotStore",
+    "StartupInfo",
     "TargetingRule",
     "Variation",
     "WeightedVariation",

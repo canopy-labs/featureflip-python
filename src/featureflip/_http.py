@@ -414,3 +414,17 @@ class HttpClient:
             salt=data.get("salt"),
             variations=variations,
         )
+
+
+def parse_wire_payload(
+    data: dict[str, Any],
+) -> tuple[list[FlagConfiguration], list[Segment]]:
+    """Parse a ``GET /v1/sdk/flags``-shaped payload without an ``HttpClient``.
+
+    The same wholesale-discard validation the live paths use: the parse methods
+    hold no state, so a persisted snapshot is accepted or rejected by exactly the
+    code that accepts or rejects a payload off the wire. Raises on any wire-contract
+    violation; an entity this build cannot evaluate is dropped, as live.
+    """
+    parser = HttpClient.__new__(HttpClient)
+    return parser.parse_flags_response(data)

@@ -67,6 +67,7 @@ class StreamingHandler:
         on_segment_updated: Callable[[], None],
         on_error: Callable[[Exception], None],
         on_update: Callable[[list[FlagConfiguration], list[Segment]], None],
+        on_ping: Callable[[], None] | None = None,
     ) -> None:
         """Initialize the streaming handler.
 
@@ -79,6 +80,7 @@ class StreamingHandler:
             on_segment_updated: Callback invoked when a segment is updated (triggers full refetch).
             on_error: Callback invoked when an error occurs.
             on_update: Callback invoked with a full (flags, segments) snapshot — a full store replace.
+            on_ping: Optional callback for the server's keep-alive ``ping`` event.
         """
         self._sdk_key = sdk_key
         self._config = config
@@ -88,6 +90,7 @@ class StreamingHandler:
         self._on_segment_updated = on_segment_updated
         self._on_error = on_error
         self._on_update = on_update
+        self._on_ping = on_ping
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # Reconnect tunables (defaulted from module constants; tests shrink them).
@@ -291,6 +294,9 @@ class StreamingHandler:
                 flags, segments = self._http.parse_flags_response(json.loads(data))
                 self._on_update(flags, segments)
                 logger.debug("sync_snapshot_applied", flag_count=len(flags))
+            elif event_type == "ping" and self._on_ping is not None:
+                # The server's keep-alive: the stream is live and healthy.
+                self._on_ping()
             # Unknown events are ignored silently
         except Exception as e:
             logger.error("event_parse_error", error=str(e), event_type=event_type)

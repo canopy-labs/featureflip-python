@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from featureflip._updates import FlagUpdateListener
     from featureflip.inspector import EvaluationInspector
+    from featureflip.snapshot import StartupInfo
 
 logger = structlog.get_logger()
 
@@ -262,6 +263,19 @@ class FeatureflipClient:
         if self._closed:
             return False
         return self._core.is_initialized
+
+    @property
+    def startup_info(self) -> StartupInfo:
+        """Where this client's flag data came from.
+
+        ``source`` is ``"live"`` after a successful fetch, ``"snapshot"`` when the
+        client started from the configured ``snapshot_store`` because the initial
+        fetch failed, and ``"none"`` when there is no data yet (defaults are
+        served). It moves to ``"live"`` on the first successful live fetch after a
+        snapshot or ``none`` start. ``reason`` and ``snapshot_age_seconds`` say
+        why a stored snapshot was used or ignored.
+        """
+        return self._core.startup_info
 
     def close(self) -> None:
         """Close this handle.

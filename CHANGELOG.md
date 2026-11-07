@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.11.0 — 2026-11-07
+
+### Added
+
+- Opt-in snapshot store: with `snapshot_store` set, the SDK saves the flag configuration as it receives it, and a later start that can't reach the Evaluation API loads the saved copy instead of serving defaults. A built-in `FileSnapshotStore` writes it to a local file, and you can implement the store interface to share one snapshot through something like Redis. A snapshot older than `max_snapshot_age_seconds` (24 hours by default) is ignored. `client.startup_info` reports whether the client started from the live API, a snapshot, or neither. Off unless you set it. (#4652)
+
+### Fixed
+
+- With a snapshot store configured and nothing stored yet, a failed or timed-out initial fetch now logs a warning naming the cause (HTTP status, timeout or error), never the SDK key. It used to log nothing. (#5153)
+- The 'option ignored' warning about `max_snapshot_age_seconds` on a reused client now appears only when the option was set explicitly. (#5151)
+
 ## 2.10.2 — 2026-10-30
 
 ### Fixed

@@ -11,7 +11,9 @@ This module is private (underscore-prefixed). The only legitimate users are
 
 from __future__ import annotations
 
+import dataclasses
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import suppress
@@ -29,18 +31,31 @@ from featureflip._updates import (
     add_prerequisite_dependents,
     diff_snapshot,
 )
+from featureflip._wire import serialize_flags_payload
 from featureflip.config import Config
 from featureflip.context import EvaluationContext
 from featureflip.detail import EvaluationDetail, EvaluationReason
 from featureflip.evaluation import FlagEvaluator
 from featureflip.exceptions import InitializationError
 from featureflip.inspector import EvaluationEvent
+from featureflip.snapshot import (
+    REASON_EXPIRED,
+    REASON_INVALID,
+    REASON_SNAPSHOT,
+    SNAPSHOT_REFRESH_INTERVAL_SECONDS,
+    SnapshotInvalidError,
+    StartupInfo,
+    compute_key_hash,
+    decode_envelope,
+    encode_envelope,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from featureflip.inspector import EvaluationInspector
     from featureflip.models import FlagConfiguration, Segment
+    from featureflip.snapshot import SnapshotStore
 
 logger = structlog.get_logger()
 
@@ -86,12 +101,40 @@ def _resolve_user_id(context: dict[str, Any]) -> str | None:
     return str(raw) if raw is not None else None
 
 
+def _monotonic() -> float:
+    """Monotonic clock for the snapshot refresh window (patched by tests)."""
+    return time.monotonic()
+
+
+def _wall_ms() -> int:
+    """Wall clock in integer epoch milliseconds (patched by tests)."""
+    return int(time.time() * 1000)
+
+
+def _describe_init_failure(err: BaseException, timed_out: bool, init_timeout: float) -> str:
+    """A short, key-free reason the initial fetch failed.
+
+    A revoked key (HTTP 401/403) must read differently from an unreachable host.
+    """
+    if timed_out:
+        return f"timed out after {init_timeout}s"
+    response = getattr(err, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return f"HTTP {status}"
+    return str(err) or type(err).__name__
+
+
 class _SharedFeatureflipCore:
     """Internal shared core owning all expensive resources of a FeatureflipClient.
 
     Refcounted: multiple FeatureflipClient handles can share one core, and the
     real shutdown runs when the last handle is released.
     """
+
+    # Class-level defaults: handles and test factories can bypass ``__init__``.
+    _snapshot_store: SnapshotStore | None = None
+    _startup: StartupInfo = StartupInfo("none")
 
     def __init__(
         self,
@@ -148,6 +191,22 @@ class _SharedFeatureflipCore:
 
         self._evaluator = FlagEvaluator()
 
+        # Snapshot store state. The lock guards the write bookkeeping only; a
+        # write itself runs on a short-lived background thread, never on the
+        # evaluation thread.
+        self._snapshot_lock = threading.Lock()
+        self._persist_in_flight = False
+        self._persist_queued = False
+        self._last_persist_at: float | None = None
+        self._last_persisted_data: str | None = None
+        self._snapshot_store = config.snapshot_store
+        self._key_hash = (
+            compute_key_hash(config.base_url, sdk_key)
+            if sdk_key and config.snapshot_store is not None
+            else ""
+        )
+        self._startup = StartupInfo("none")
+
         self._http_client: HttpClient | None = None
         self._streaming_handler: StreamingHandler | None = None
         self._polling_handler: PollingHandler | None = None
@@ -160,6 +219,7 @@ class _SharedFeatureflipCore:
             # test is a real change and must be diffed, not swallowed as a
             # baseline.
             self._has_snapshot = True
+            self._startup = StartupInfo("live")
             return
 
         # Production path: requires a real SDK key
@@ -413,11 +473,19 @@ class _SharedFeatureflipCore:
     def _fetch_initial_flags(self) -> None:
         """Fetch initial flag configurations with timeout.
 
+        Without a snapshot store a failure raises. With one, the failure falls
+        back to the stored snapshot (or defaults) and init completes: the data
+        source started afterwards keeps trying and recovers when the API returns.
+
         Raises:
-            InitializationError: If fetching times out or fails.
+            InitializationError: If fetching times out or fails and no snapshot
+                store is configured.
         """
         assert self._http_client is not None
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        # Not a ``with`` block: its exit would wait for a hung fetch and defeat
+        # init_timeout. A late result is discarded (it is never applied).
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
             future = executor.submit(self._http_client.get_flags)
             try:
                 flags, segments = future.result(timeout=self._config.init_timeout)
@@ -425,17 +493,130 @@ class _SharedFeatureflipCore:
                 self._apply_snapshot(flags, segments)
                 self._initialized.set()
                 logger.info("client_initialized", flag_count=len(flags))
-            except FuturesTimeoutError as e:
-                raise InitializationError(
-                    f"Initialization timeout after {self._config.init_timeout}s"
-                ) from e
             except Exception as e:
-                raise InitializationError(f"Failed to initialize: {e}") from e
+                timed_out = isinstance(e, FuturesTimeoutError)
+                if self._snapshot_store is None:
+                    if timed_out:
+                        raise InitializationError(
+                            f"Initialization timeout after {self._config.init_timeout}s"
+                        ) from e
+                    raise InitializationError(f"Failed to initialize: {e}") from e
+                cause = _describe_init_failure(e, timed_out, self._config.init_timeout)
+                self._load_snapshot_fallback(cause)
+                self._initialized.set()
+        finally:
+            executor.shutdown(wait=False)
+
+    def _read_snapshot_store(self, cause: str) -> tuple[bool, Any]:
+        """Read the store on a daemon thread, bounded by init_timeout.
+
+        Returns ``(finished, value)``. A raising store is a miss (warned). A read
+        still running at the deadline is abandoned and its late result ignored.
+        """
+        store = self._snapshot_store
+        assert store is not None
+        box: dict[str, Any] = {}
+
+        def read() -> None:
+            try:
+                box["value"] = store.get()
+            except Exception as e:
+                box["error"] = e
+
+        reader = threading.Thread(
+            target=read, name="featureflip-snapshot-read", daemon=True
+        )
+        reader.start()
+        reader.join(self._config.init_timeout)
+        if reader.is_alive():
+            logger.warning(
+                "snapshot_store_read_timed_out",
+                message=(
+                    f"initial flag fetch failed ({cause}) and the snapshot store "
+                    f"read timed out after {self._config.init_timeout}s; serving "
+                    "defaults"
+                ),
+            )
+            return False, None
+        if "error" in box:
+            logger.warning(
+                "snapshot_store_read_failed",
+                message=(
+                    f"initial flag fetch failed ({cause}) and the snapshot store "
+                    f"read failed: {box['error']}; serving defaults"
+                ),
+            )
+            return True, None
+        return True, box.get("value")
+
+    def _load_snapshot_fallback(self, cause: str) -> None:
+        """Serve the stored snapshot after a failed initial fetch. Never raises.
+
+        Applied without persisting, so loading it does not refresh its own
+        ``fetchedAt``. The store hands back opaque text; every check and every
+        reason is decided here (see ``decode_envelope``).
+        """
+        try:
+            finished, value = self._read_snapshot_store(cause)
+            if not finished:
+                return  # the read timeout was already logged
+            if value is None:
+                # A miss still has to say why the fetch failed (never the key).
+                logger.warning(
+                    "no_snapshot_stored",
+                    message=(
+                        f"initial flag fetch failed ({cause}); no snapshot "
+                        "stored; serving defaults"
+                    ),
+                )
+                return
+            now = _wall_ms()
+            try:
+                decoded = decode_envelope(value, self._key_hash, now)
+            except SnapshotInvalidError as e:
+                self._reject_snapshot(cause, REASON_INVALID, e.why)
+                return
+            age_ms = max(0, now - decoded.fetched_at_ms)
+            age_seconds = age_ms // 1000
+            limit = self._config.max_snapshot_age_seconds
+            if age_ms > limit * 1000:
+                self._reject_snapshot(
+                    cause,
+                    REASON_EXPIRED,
+                    f"{age_seconds}s old, limit {limit}s",
+                    age_seconds,
+                )
+                return
+            self._apply_snapshot(decoded.flags, decoded.segments, live=False)
+            self._startup = StartupInfo("snapshot", REASON_SNAPSHOT, age_seconds)
+            logger.warning(
+                "serving_persisted_snapshot",
+                message=(
+                    f"initial flag fetch failed ({cause}); serving persisted "
+                    f"snapshot ({age_seconds}s old)"
+                ),
+            )
+        except Exception as e:
+            logger.warning("snapshot_load_failed", error=str(e))
+
+    def _reject_snapshot(
+        self, cause: str, reason: str, why: str, age_seconds: int | None = None
+    ) -> None:
+        self._startup = StartupInfo("none", reason, age_seconds)
+        logger.warning(
+            "ignoring_persisted_snapshot",
+            message=(
+                f"initial flag fetch failed ({cause}); ignoring persisted "
+                f"snapshot ({reason}: {why}); serving defaults"
+            ),
+        )
 
     def _apply_snapshot(
         self,
         flags: list[FlagConfiguration],
         segments: list[Segment] | None,
+        *,
+        live: bool = True,
     ) -> None:
         """Replace the store with a full snapshot and notify what changed.
 
@@ -446,6 +627,9 @@ class _SharedFeatureflipCore:
         ``segments=None`` means "this source did not carry segments"; the
         existing segments are kept and excluded from the diff, rather than
         being treated as deleted.
+
+        ``live=False`` is a snapshot loaded from the store: it is applied as the
+        baseline but never persisted and does not move ``startup_info`` to live.
         """
         with self._flags_lock:
             if self._has_snapshot:
@@ -464,6 +648,10 @@ class _SharedFeatureflipCore:
                 self._segments = {segment.key: segment for segment in segments}
             self._has_snapshot = True
 
+        if live:
+            self._startup = StartupInfo("live")
+            self._persist_full()
+
         # Outside the lock: listeners are user code and may re-enter the client.
         self._notify_update_listeners(changed)
 
@@ -480,6 +668,7 @@ class _SharedFeatureflipCore:
                 if previous != flag
                 else []
             )
+        self._persist_delta()
         self._notify_update_listeners(changed)
 
     def _with_prerequisite_dependents_locked(self, key: str) -> list[str]:
@@ -497,6 +686,127 @@ class _SharedFeatureflipCore:
         changed = {key}
         add_prerequisite_dependents(self._flags.values(), changed)
         return sorted(changed)
+
+    # --- Snapshot persistence ---
+
+    @property
+    def startup_info(self) -> StartupInfo:
+        """Where the flag data came from: live, a stored snapshot, or nowhere."""
+        return self._startup
+
+    def _within_refresh_window(self) -> bool:
+        with self._snapshot_lock:
+            last = self._last_persist_at
+        return (
+            last is not None
+            and _monotonic() - last < SNAPSHOT_REFRESH_INTERVAL_SECONDS
+        )
+
+    def _serialize_state(self) -> str:
+        with self._flags_lock:
+            flags = list(self._flags.values())
+            segments = list(self._segments.values())
+        return serialize_flags_payload(flags, segments)
+
+    def _persist_delta(self) -> None:
+        """Persist after a single-flag delta, only once live.
+
+        Never right after a snapshot or ``none`` start, or stale data would get a
+        fresh ``fetchedAt``.
+        """
+        if self._snapshot_store is not None and self._startup.source == "live":
+            self._persist()
+
+    def _persist_full(self) -> None:
+        """Persist after a full live apply.
+
+        Changed content is written at once. An unchanged state is only rewritten
+        once the last write is a refresh interval old.
+        """
+        if self._snapshot_store is None or self._is_shut_down:
+            return
+        if self._within_refresh_window():
+            try:
+                data = self._serialize_state()
+            except Exception as e:
+                logger.warning("snapshot_persist_failed", error=str(e))
+                return
+            with self._snapshot_lock:
+                if data == self._last_persisted_data:
+                    return
+        self._persist()
+
+    def _persist(self) -> None:
+        """Write the full state without blocking evaluation or init.
+
+        At most one put in flight plus one trailing write, which reads the state
+        when it runs. The put runs on a short-lived daemon thread.
+        """
+        if self._snapshot_store is None or self._is_shut_down:
+            return
+        with self._snapshot_lock:
+            if self._persist_in_flight:
+                self._persist_queued = True
+                return
+            self._persist_in_flight = True
+        text = self._build_snapshot_text()
+        if text is None:
+            text = self._finish_persist()
+            if text is None:
+                return
+        try:
+            threading.Thread(
+                target=self._persist_worker,
+                args=(text,),
+                name="featureflip-snapshot-write",
+                daemon=True,
+            ).start()
+        except Exception as e:
+            # Can't start a thread (resource limit, interpreter shutdown). Don't
+            # leave the in-flight flag set, or every later write is wedged, and
+            # never let this escape into an apply (it would fail a good fetch).
+            with self._snapshot_lock:
+                self._persist_in_flight = False
+                self._persist_queued = False
+            logger.warning("snapshot_persist_failed", error=str(e))
+
+    def _build_snapshot_text(self) -> str | None:
+        """The envelope for the current state, stamped now. Never raises."""
+        try:
+            fetched_at = _wall_ms()
+            data = self._serialize_state()
+            with self._snapshot_lock:
+                self._last_persist_at = _monotonic()
+                self._last_persisted_data = data
+            return encode_envelope(self._key_hash, fetched_at, data)
+        except Exception as e:
+            logger.warning("snapshot_persist_failed", error=str(e))
+            return None
+
+    def _finish_persist(self) -> str | None:
+        """End one write. Returns the next envelope if a trailing write is due.
+
+        No trailing write starts once the core is shut down.
+        """
+        while True:
+            with self._snapshot_lock:
+                if not (self._persist_queued and not self._is_shut_down):
+                    self._persist_queued = False
+                    self._persist_in_flight = False
+                    return None
+                self._persist_queued = False
+            text = self._build_snapshot_text()
+            if text is not None:
+                return text
+
+    def _persist_worker(self, text: str | None) -> None:
+        store = self._snapshot_store
+        while text is not None and store is not None:
+            try:
+                store.put(text)
+            except Exception as e:
+                logger.warning("snapshot_store_write_failed", error=str(e))
+            text = self._finish_persist()
 
     # --- Update listeners ---
 
@@ -550,6 +860,7 @@ class _SharedFeatureflipCore:
                 if self._flags.pop(key, None) is not None
                 else []
             )
+        self._persist_delta()
         self._notify_update_listeners(changed)
 
     def _on_streaming_segment_updated(self) -> None:
@@ -564,6 +875,19 @@ class _SharedFeatureflipCore:
             self._apply_snapshot(flags, segments)
         except Exception as e:
             logger.warning("streaming_segment_refetch_error", error=str(e))
+
+    def _on_streaming_ping(self) -> None:
+        """The stream heartbeat: while live, refresh the stored ``fetchedAt``.
+
+        At most once per ``SNAPSHOT_REFRESH_INTERVAL_SECONDS``, so a healthy
+        streaming client with no changes does not let its snapshot age out.
+        Never after a snapshot or ``none`` start: that state is not live data.
+        """
+        if self._snapshot_store is None or self._startup.source != "live":
+            return
+        if self._within_refresh_window():
+            return
+        self._persist()
 
     def _on_streaming_error(self, error: Exception) -> None:
         logger.warning("streaming_error", error=str(error))
@@ -593,6 +917,7 @@ class _SharedFeatureflipCore:
             on_segment_updated=self._on_streaming_segment_updated,
             on_error=self._on_streaming_error,
             on_update=self._on_polling_update,
+            on_ping=self._on_streaming_ping,
         )
         self._streaming_handler.start()
 
@@ -790,6 +1115,23 @@ def _get_or_create_core(sdk_key: str, config: Config) -> _SharedFeatureflipCore:
     with _LIVE_CORES_LOCK:
         existing = _LIVE_CORES.get(sdk_key)
         if existing is not None and existing._acquire():
+            ignored = _ignored_snapshot_options(existing._config, config)
+            if ignored:
+                logger.warning(
+                    "featureflip_snapshot_options_ignored",
+                    message=(
+                        f"FeatureflipClient was passed {' and '.join(ignored)}, "
+                        "which is ignored because the client for this SDK key "
+                        "already exists. Pass it on the first client built for "
+                        "the key."
+                    ),
+                )
+            if "max_snapshot_age_seconds" in ignored or not config.max_snapshot_age_explicit:
+                # Reported by name, or never set: not a generic mismatch.
+                config = dataclasses.replace(
+                    config,
+                    max_snapshot_age_seconds=existing._config.max_snapshot_age_seconds,
+                )
             if not _configs_equal(existing._config, config):
                 logger.warning(
                     "featureflip_client_config_mismatch",
@@ -866,12 +1208,33 @@ def _reset_for_testing() -> None:
         core._release()
 
 
+def _ignored_snapshot_options(existing: Config, passed: Config) -> list[str]:
+    """Snapshot options passed to a later client that the cached core ignores.
+
+    The store is a live object the core already holds, so it is compared by
+    identity. Omitting it on a later client is not a mismatch.
+    """
+    ignored: list[str] = []
+    if (
+        passed.snapshot_store is not None
+        and passed.snapshot_store is not existing.snapshot_store
+    ):
+        ignored.append("snapshot_store")
+    if (
+        passed.max_snapshot_age_explicit
+        and passed.max_snapshot_age_seconds != existing.max_snapshot_age_seconds
+    ):
+        ignored.append("max_snapshot_age_seconds")
+    return ignored
+
+
 def _configs_equal(a: Config, b: Config) -> bool:
-    """Compare two Config objects by value across the 9 comparable fields.
+    """Compare two Config objects by value across the 10 comparable fields.
 
     ``inspectors`` is deliberately excluded: callbacks aren't structurally
     comparable, and a differing callback must not trigger the "different
-    options" warning for a shared core. So are ``wrapper_name`` and
+    options" warning for a shared core. So is ``snapshot_store`` (compared by
+    identity in ``_ignored_snapshot_options``). So are ``wrapper_name`` and
     ``wrapper_version``: they identify the caller rather than change behavior.
     """
     return (
@@ -884,4 +1247,5 @@ def _configs_equal(a: Config, b: Config) -> bool:
         and a.flush_interval == b.flush_interval
         and a.flush_batch_size == b.flush_batch_size
         and a.init_timeout == b.init_timeout
+        and a.max_snapshot_age_seconds == b.max_snapshot_age_seconds
     )
