@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import threading
 
-import structlog
+from featureflip._redact import get_logger
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 _MAX_KEYS = 1000
 _seen: set[tuple[str, str, str]] = set()

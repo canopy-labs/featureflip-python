@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING, Protocol
 
-import structlog
+from featureflip._redact import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from featureflip.config import Config
     from featureflip.models import FlagConfiguration, Segment
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 # Ceiling for the fallback poller's exponential backoff during a sustained
 # outage. Retry-forever, but escalate the interval so a long outage doesn't keep

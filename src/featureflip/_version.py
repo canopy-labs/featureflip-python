@@ -13,7 +13,7 @@ import re
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
-import structlog
+from featureflip._redact import get_logger
 
 try:
     __version__ = _distribution_version("featureflip")
@@ -40,7 +40,7 @@ def user_agent(wrapper_name: str | None, wrapper_version: str | None) -> str:
         wrapper_version is None or _TOKEN.fullmatch(wrapper_version) is not None
     )
     if not valid:
-        structlog.get_logger().warning(
+        get_logger(__name__).warning(
             "featureflip_invalid_wrapper",
             message=f"Ignoring wrapper '{wrapper_name}/{wrapper_version}': not a valid User-Agent product token",
         )

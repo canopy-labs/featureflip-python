@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.11.1 — 2026-11-16
+
+### Security
+
+- The SDK key is now redacted from every log line the SDK emits, including error messages from the HTTP stack, and from the message of the `InitializationError` raised when the first fetch fails. A transport that quotes the `Authorization` header in its error used to put the key in the log or the exception. (#5167, #5166)
+
 ## 2.11.0 — 2026-11-07
 
 ### Added

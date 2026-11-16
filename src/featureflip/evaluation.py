@@ -8,9 +8,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-import structlog
-
 from featureflip._canonical_number import canonical_decimal, canonical_number
+from featureflip._redact import get_logger
 from featureflip._semver import compare_semver
 from featureflip._unbucketable import warn_unbucketable
 from featureflip.context import NON_SCALAR_TYPES
@@ -31,7 +30,7 @@ from featureflip.models import (
     ServeType,
 )
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 MAX_PREREQUISITE_DEPTH = 10
 

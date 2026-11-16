@@ -7,9 +7,10 @@ import time
 from typing import Any, Protocol
 
 import httpx
-import structlog
 
-logger = structlog.get_logger()
+from featureflip._redact import get_logger
+
+logger = get_logger(__name__)
 
 #: Upper bound on buffered events.
 #:

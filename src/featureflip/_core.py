@@ -20,11 +20,14 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypeVar
 
-import structlog
-
 from featureflip._events import EventProcessor
 from featureflip._http import HttpClient
 from featureflip._polling import PollingHandler
+from featureflip._redact import (
+    get_logger,
+    redact_text,
+    register_key,
+)
 from featureflip._streaming import StreamingHandler
 from featureflip._updates import (
     FlagUpdateListener,
@@ -57,7 +60,7 @@ if TYPE_CHECKING:
     from featureflip.models import FlagConfiguration, Segment
     from featureflip.snapshot import SnapshotStore
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 T = TypeVar("T")
 
@@ -161,6 +164,9 @@ class _SharedFeatureflipCore:
 
         self._sdk_key = sdk_key
         self._config = config
+        # Before anything can log: every SDK log line is redacted against the
+        # keys this process has used, never released. See _redact.py.
+        register_key(sdk_key)
 
         # Filter to callables defensively — Python callers bypass the type
         # hints, and a non-callable entry must be dropped at construction
@@ -485,6 +491,7 @@ class _SharedFeatureflipCore:
         # Not a ``with`` block: its exit would wait for a hung fetch and defeat
         # init_timeout. A late result is discarded (it is never applied).
         executor = ThreadPoolExecutor(max_workers=1)
+        failure: str | None = None
         try:
             future = executor.submit(self._http_client.get_flags)
             try:
@@ -496,16 +503,29 @@ class _SharedFeatureflipCore:
             except Exception as e:
                 timed_out = isinstance(e, FuturesTimeoutError)
                 if self._snapshot_store is None:
-                    if timed_out:
-                        raise InitializationError(
-                            f"Initialization timeout after {self._config.init_timeout}s"
-                        ) from e
-                    raise InitializationError(f"Failed to initialize: {e}") from e
-                cause = _describe_init_failure(e, timed_out, self._config.init_timeout)
-                self._load_snapshot_fallback(cause)
-                self._initialized.set()
+                    # The cause can quote the Authorization header (a transport
+                    # that echoes request headers), and a host that logs the
+                    # traceback, or a tool that walks __cause__/__context__,
+                    # renders the chain. So the original is neither chained nor
+                    # left as context: capture its type and redacted text here
+                    # and raise after leaving this block (#5166).
+                    failure = (
+                        f"Initialization timeout after {self._config.init_timeout}s"
+                        if timed_out
+                        else redact_text(
+                            f"Failed to initialize: {type(e).__name__}: {e}"
+                        )
+                    )
+                else:
+                    cause = _describe_init_failure(
+                        e, timed_out, self._config.init_timeout
+                    )
+                    self._load_snapshot_fallback(cause)
+                    self._initialized.set()
         finally:
             executor.shutdown(wait=False)
+        if failure is not None:
+            raise InitializationError(failure)
 
     def _read_snapshot_store(self, cause: str) -> tuple[bool, Any]:
         """Read the store on a daemon thread, bounded by init_timeout.

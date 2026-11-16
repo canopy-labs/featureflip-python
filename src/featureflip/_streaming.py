@@ -8,10 +8,10 @@ import threading
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
-import structlog
 from httpx_sse import connect_sse
 
 from featureflip._polling import PollingHandler
+from featureflip._redact import get_logger
 from featureflip._version import user_agent
 
 if TYPE_CHECKING:
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from featureflip.config import Config
     from featureflip.models import FlagConfiguration, Segment
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 
 class _StreamingHttpClient(Protocol):

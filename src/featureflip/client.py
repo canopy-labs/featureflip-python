@@ -5,9 +5,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-import structlog
-
 from featureflip._core import _get_or_create_core, _SharedFeatureflipCore
+from featureflip._redact import get_logger
 from featureflip.config import Config
 from featureflip.detail import EvaluationDetail, EvaluationReason
 
@@ -18,7 +17,7 @@ if TYPE_CHECKING:
     from featureflip.inspector import EvaluationInspector
     from featureflip.snapshot import StartupInfo
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 T = TypeVar("T")
 

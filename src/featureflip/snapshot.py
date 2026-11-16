@@ -18,14 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
-import structlog
-
 from featureflip._http import parse_wire_payload
+from featureflip._redact import get_logger
 
 if TYPE_CHECKING:
     from featureflip.models import FlagConfiguration, Segment
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 __all__ = ["FileSnapshotStore", "SnapshotStore", "StartupInfo"]
 

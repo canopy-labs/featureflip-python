@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
-import structlog
 
+from featureflip._redact import get_logger
 from featureflip._version import user_agent
 from featureflip.exceptions import UnevaluableEntityError
 from featureflip.models import (
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from featureflip.config import Config
 
-logger = structlog.get_logger()
+logger = get_logger(__name__)
 
 _T = TypeVar("_T")
 _E = TypeVar("_E", ServeType, ConditionLogic)
