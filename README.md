@@ -122,6 +122,24 @@ Listeners run on the SDK's streaming or polling thread, so they must not block.
 A listener that raises is logged and isolated, affecting neither flag delivery
 nor the other listeners.
 
+## FastAPI
+
+```bash
+pip install "featureflip[fastapi]"
+```
+
+```python
+from fastapi import Depends, FastAPI
+from featureflip import FeatureflipClient
+from featureflip.integrations.fastapi import featureflip_lifespan, get_featureflip_client
+
+app = FastAPI(lifespan=featureflip_lifespan())  # reads FEATUREFLIP_SDK_KEY
+
+@app.get("/")
+def home(client: FeatureflipClient = Depends(get_featureflip_client)):
+    return {"on": client.variation("new-ui", {"user_id": "1"}, default=False)}
+```
+
 ## Testing
 
 Use the test client for deterministic unit tests:

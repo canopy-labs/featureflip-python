@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "featureflip"
-version = "2.11.1"
+version = "2.12.0"
 description = "Python SDK for Featureflip - a feature flag SaaS platform"
 readme = "README.md"
 license = "Apache-2.0"
@@ -30,7 +30,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fastapi = [
+    "fastapi>=0.110.0",
+]
 dev = [
+    "fastapi>=0.110.0",
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.23.0",

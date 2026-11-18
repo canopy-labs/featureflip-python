@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.12.0 — 2026-11-18
+
+### Added
+
+- FastAPI integration, `featureflip.integrations.fastapi`. `featureflip_lifespan()` builds the client once at startup, stores it on `app.state.featureflip` and closes it at shutdown, and `get_featureflip_client` is a `Depends` provider for routes. Install with `pip install "featureflip[fastapi]"`; the base install does not depend on FastAPI. The provider also works on WebSocket routes and on routes of a mounted sub-app.
+
 ## 2.11.1 — 2026-11-16
 
 ### Security
